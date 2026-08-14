@@ -709,6 +709,7 @@ export function toolAccessRoutes(
         userId: req.actor.userId ?? "board",
         toolName: req.body.toolName,
         parameters: req.body.parameters ?? {},
+        timeoutMs: req.body.timeoutMs,
       });
       res.json(result);
     } catch (error) {

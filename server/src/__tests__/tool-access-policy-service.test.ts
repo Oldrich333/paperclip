@@ -193,7 +193,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     const result = await toolAccessPolicyService(db).decide({
       companyId: company.id,
       actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
-      request: { connectionId: connection.id, catalogEntryId: catalogEntry.id, toolName: "send_email" },
+      request: { connectionId: connection.id, catalogEntryId: catalogEntry.id, toolName: "mcp.mail:send-email" },
     });
 
     expect(result).toMatchObject({
@@ -230,7 +230,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     const result = await toolAccessPolicyService(db).decide({
       companyId: company.id,
       actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
-      request: { connectionId: connection.id, catalogEntryId: catalogEntry.id, toolName: "send_email" },
+      request: { connectionId: connection.id, catalogEntryId: catalogEntry.id, toolName: "mcp.mail:send-email" },
     });
 
     expect(result).toMatchObject({

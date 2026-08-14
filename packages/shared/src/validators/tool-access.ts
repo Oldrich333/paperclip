@@ -670,6 +670,7 @@ export const toolConnectionTestCallSchema = z.object({
   agentId: z.string().uuid(),
   toolName: z.string().trim().min(1).max(240),
   parameters: z.unknown().optional(),
+  timeoutMs: z.number().int().positive().max(60_000).optional(),
 });
 
 export type ToolConnectionTestCallInput = z.infer<typeof toolConnectionTestCallSchema>;
