@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 const {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -157,5 +160,48 @@ describe("codex_local ACP startup fallback", () => {
     await expect(execute(ctx as never)).rejects.toThrow('Unexpected "<<"');
 
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+  });
+
+  it("bypasses auto-selected ACP when the deployment rulebook is configured", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-acp-rulebook-"));
+    const sourcePath = path.join(root, "agent_rulebook.md");
+    await writeFile(sourcePath, "canonical HIVE instructions\n", "utf8");
+    const previousSource = process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+    process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = sourcePath;
+    try {
+      const ctx = buildContext();
+      const result = await execute(ctx as never);
+
+      expect(result.exitCode).toBe(0);
+      expect(executeCodexAcp).not.toHaveBeenCalled();
+      expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
+      expect(ctx.onLog).toHaveBeenCalledWith(
+        "stderr",
+        expect.stringContaining("bypassing auto-selected ACP and using CLI"),
+      );
+    } finally {
+      if (previousSource === undefined) delete process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = previousSource;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for explicit ACP when either deployment layer is configured", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-acp-base-"));
+    const sourcePath = path.join(root, "codex_model_instructions.md");
+    await writeFile(sourcePath, "Codex base calibration\n", "utf8");
+    const previousSource = process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE;
+    process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE = sourcePath;
+    try {
+      await expect(execute(buildContext({ engine: "acp" }) as never)).rejects.toThrow(
+        "Codex ACP cannot receive",
+      );
+      expect(executeCodexAcp).not.toHaveBeenCalled();
+      expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+    } finally {
+      if (previousSource === undefined) delete process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE = previousSource;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
