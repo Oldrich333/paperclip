@@ -959,16 +959,6 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
       ]),
     );
-    const catalogAfterRemoval = await db
-      .select()
-      .from(toolCatalogEntries)
-      .where(eq(toolCatalogEntries.connectionId, connection.id));
-    expect(catalogAfterRemoval).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ toolName: "search_notes", status: "removed" }),
-        expect.objectContaining({ toolName: "send_email", status: "quarantined" }),
-      ]),
-    );
   });
 
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {

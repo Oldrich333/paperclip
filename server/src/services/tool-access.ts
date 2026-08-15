@@ -2942,21 +2942,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     const existingRows = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection.id));
     const existingByName = new Map(existingRows.map((entry) => [entry.toolName, entry]));
-    const discoveredNames = new Set(descriptors.map((descriptor) => descriptor.name));
-    const removedIds = existingRows
-      .filter((entry) => entry.status !== "removed" && !discoveredNames.has(entry.toolName))
-      .map((entry) => entry.id);
-    if (removedIds.length > 0) {
-      await db
-        .update(toolCatalogEntries)
-        .set({
-          status: "removed",
-          quarantinedAt: null,
-          quarantineReason: null,
-          updatedAt: now,
-        })
-        .where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, removedIds)));
-    }
     const updatedEntries: ToolCatalogEntry[] = [];
     let quarantinedCount = 0;
     const quarantineOnRefresh = shouldQuarantineNewEntries(connection) && connection.status === "active";
@@ -3059,7 +3044,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       connectionId: connection.id,
       action: "tool_connection.catalog_refresh",
       outcome: "success",
-      details: { discoveredCount: descriptors.length, quarantinedCount, removedCount: removedIds.length },
+      details: { discoveredCount: descriptors.length, quarantinedCount },
       actor,
     });
 
