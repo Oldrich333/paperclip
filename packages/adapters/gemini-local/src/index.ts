@@ -72,6 +72,7 @@ Notes:
 - Runs use --prompt for non-interactive execution, not stdin.
 - The adapter sets a headless-safe terminal/browser environment for Gemini CLI child processes so unattended runs do not wait on browser auth or 256-color terminal prompts.
 - Sessions resume with --resume when stored session cwd matches the current cwd.
-- Paperclip auto-injects local skills into \`~/.gemini/skills/\` via symlinks, so the CLI can discover both credentials and skills in their natural location.
+- When PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE is configured for the CLI lane, Paperclip creates a unique per-run Gemini home, writes the canonical source to its supported global \`.gemini/GEMINI.md\`, and links or copies authentication/state from the configured Gemini home. Skills are injected only into that owned per-run home. Remote CLI runs fail closed while this deployment source is configured because their native Gemini-home cleanup lifecycle is not proven.
+- Gemini ACP does not receive the deployment source: Paperclip fails closed rather than turning canonical system policy into a user prompt. Pin \`engine: cli\` when the deployment rulebook is required.
 - Authentication can use GEMINI_API_KEY / GOOGLE_API_KEY or local Gemini CLI login.
 `;

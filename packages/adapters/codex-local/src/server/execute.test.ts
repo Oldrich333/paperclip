@@ -117,6 +117,37 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     );
   }
 
+  it("fails closed before remote staging when model instructions are configured", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-model-"));
+    const modelInstructionsPath = path.join(rootDir, "codex_model_instructions.md");
+    await mkdir(path.join(rootDir, "workspace"), { recursive: true });
+    await writeFile(modelInstructionsPath, "Codex base calibration\n", "utf8");
+    const previousSource = process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE;
+    process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE = modelInstructionsPath;
+    try {
+      await expect(execute({
+        runId: "codex-remote-model-run",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "CodexCoder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/remote/workspace" },
+        config: { command: "codex", cwd: path.join(rootDir, "workspace"), engine: "cli" },
+        context: {},
+        onLog: async () => {},
+      } as never)).rejects.toThrow("Codex remote execution is refused");
+      expect(prepareAdapterExecutionTargetRuntime).not.toHaveBeenCalled();
+    } finally {
+      if (previousSource === undefined) delete process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE = previousSource;
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   async function runTeardown(input: {
     sandboxAuth: string;
     hostAuth: string;

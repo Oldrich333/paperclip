@@ -35,6 +35,8 @@ export function buildCodexExecArgs(
     skipGitRepoCheck?: boolean;
     /** Deployment-owned instructions delivered through Codex's native config. */
     systemInstructions?: string | null;
+    /** HIVE's Codex vendor/base calibration file, kept separate from the rulebook. */
+    modelInstructionsFile?: string | null;
   } = {},
 ): BuildCodexExecArgsResult {
   const record = asRecord(config);
@@ -62,6 +64,9 @@ export function buildCodexExecArgs(
   }
   if (fastModeApplied) {
     args.push("-c", 'service_tier="fast"', "-c", "features.fast_mode=true");
+  }
+  if (options.modelInstructionsFile?.trim()) {
+    args.push("-c", `model_instructions_file=${JSON.stringify(options.modelInstructionsFile.trim())}`);
   }
   if (options.systemInstructions?.trim()) {
     args.push(

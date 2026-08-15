@@ -47,6 +47,7 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
+  readDeploymentSystemInstructions,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
@@ -66,6 +67,83 @@ import {
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeGeminiAcp = createGeminiAcpExecutor();
+
+type StagedGeminiSystemInstructions = {
+  sourcePath: string;
+  path: string;
+  contents: string;
+  envPatch: Record<string, string>;
+  cleanup: () => Promise<void>;
+};
+
+/**
+ * Gemini CLI's supported global context is `$HOME/.gemini/GEMINI.md`. Use a
+ * unique per-run home so concurrent Paperclip runs never race on a shared
+ * GEMINI.md. Authentication/state entries are linked from the configured
+ * source home, matching HIVE1's Gemini home preparation; mutable skills are
+ * created in the owned run home instead.
+ */
+async function stageGeminiSystemInstructions(input: {
+  env: Record<string, string>;
+}): Promise<StagedGeminiSystemInstructions | null> {
+  const systemInstructions = await readDeploymentSystemInstructions();
+  if (!systemInstructions) return null;
+  const sourceHome = path.resolve(input.env.GEMINI_CLI_HOME?.trim() || input.env.HOME?.trim() || os.homedir());
+  const sourceGemini = path.join(sourceHome, ".gemini");
+  const runHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-home-"));
+  const runGemini = path.join(runHome, ".gemini");
+  try {
+    await fs.mkdir(runGemini, { recursive: true, mode: 0o700 });
+    await fs.chmod(runHome, 0o700);
+    await fs.chmod(runGemini, 0o700);
+    const linkOrCopy = async (source: string, target: string, directory = false) => {
+      try {
+        await fs.symlink(source, target, directory ? "junction" : undefined);
+      } catch {
+        if (directory) {
+          await fs.cp(source, target, { recursive: true, force: false });
+        } else {
+          await fs.copyFile(source, target);
+        }
+      }
+    };
+    const settingsSource = path.join(sourceGemini, "settings.json");
+    if (await fs.access(settingsSource).then(() => true).catch(() => false)) {
+      await fs.copyFile(settingsSource, path.join(runGemini, "settings.json"));
+      await fs.chmod(path.join(runGemini, "settings.json"), 0o600);
+    }
+    for (const name of [
+      "oauth_creds.json", "google_accounts.json", "installation_id", "user_id",
+      "projects.json", "state.json", "trustedFolders.json",
+    ]) {
+      const source = path.join(sourceGemini, name);
+      const target = path.join(runGemini, name);
+      if (!(await fs.access(source).then(() => true).catch(() => false))) continue;
+      await linkOrCopy(source, target);
+    }
+    for (const name of ["history", "antigravity", "antigravity-cli", "config", "tmp"]) {
+      const source = path.join(sourceGemini, name);
+      const target = path.join(runGemini, name);
+      if (!(await fs.access(source).then(() => true).catch(() => false))) continue;
+      await linkOrCopy(source, target, true);
+    }
+    const rulebookPath = path.join(runGemini, "GEMINI.md");
+    await fs.writeFile(rulebookPath, `${systemInstructions.contents.trimEnd()}\n`, { encoding: "utf8", flag: "wx" });
+    await fs.chmod(rulebookPath, 0o600);
+    return {
+      sourcePath: systemInstructions.path,
+      path: rulebookPath,
+      contents: systemInstructions.contents,
+      envPatch: { HOME: runHome, USERPROFILE: runHome, GEMINI_CLI_HOME: runHome },
+      cleanup: async () => {
+        await fs.rm(runHome, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await fs.rm(runHome, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
 
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
   const raw = env[key];
@@ -128,25 +206,22 @@ function renderApiAccessNote(env: Record<string, string>): string {
   ].join("\n");
 }
 
-function geminiSkillsHome(): string {
-  return path.join(os.homedir(), ".gemini", "skills");
+function geminiSkillsHome(env: Record<string, string> = {}): string {
+  const home = env.GEMINI_CLI_HOME?.trim() || env.HOME?.trim() || os.homedir();
+  return path.join(home, ".gemini", "skills");
 }
 
-/**
- * Inject Paperclip skills directly into `~/.gemini/skills/` via symlinks.
- * This avoids needing GEMINI_CLI_HOME overrides, so the CLI naturally finds
- * both its auth credentials and the injected skills in the real home directory.
- */
+/** Inject Paperclip skills into the effective Gemini home via symlinks. */
 async function ensureGeminiSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
   desiredSkillNames?: string[],
+  skillsHome = geminiSkillsHome(),
 ): Promise<void> {
   const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
   const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
   if (selectedEntries.length === 0) return;
 
-  const skillsHome = geminiSkillsHome();
   try {
     await fs.mkdir(skillsHome, { recursive: true });
   } catch (err) {
@@ -203,7 +278,13 @@ async function buildGeminiSkillsDir(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveGeminiExecutionEngineForRun(ctx);
+  const deploymentSystemInstructions = await readDeploymentSystemInstructions();
   if (engineSelection.engine === "acp") {
+    if (deploymentSystemInstructions) {
+      throw new Error(
+        "Gemini ACP cannot receive PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE through a native system-context channel; refusing to turn the HIVE policy into a user prompt. Set engine=cli.",
+      );
+    }
     try {
       return await executeGeminiAcp(ctx);
     } catch (err) {
@@ -225,6 +306,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  if (executionTargetIsRemote && deploymentSystemInstructions) {
+    throw new Error(
+      "Gemini remote execution is refused while PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE is configured; Paperclip has no proven remote native GEMINI.md cleanup lifecycle.",
+    );
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -254,9 +340,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const geminiSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredGeminiSkillNames = resolvePaperclipDesiredSkillNames(config, geminiSkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensureGeminiSkillsInjected(onLog, geminiSkillEntries, desiredGeminiSkillNames);
-  }
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
@@ -313,6 +396,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
+  let stagedSystemInstructions: StagedGeminiSystemInstructions | null = null;
+  let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+  let remoteSkillsDir: string | null = null;
+  let localSkillsDir: string | null = null;
+  let remoteRuntimeRootDir: string | null = null;
+  let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  try {
+    stagedSystemInstructions = await stageGeminiSystemInstructions({ env });
+  if (stagedSystemInstructions) Object.assign(env, stagedSystemInstructions.envPatch);
+  if (!executionTargetIsRemote) {
+    await ensureGeminiSkillsInjected(
+      onLog,
+      geminiSkillEntries,
+      desiredGeminiSkillNames,
+      geminiSkillsHome(env),
+    );
+  }
   const runtimeEnv = buildGeminiRuntimeEnv(env);
   const billingType = resolveGeminiBillingType(runtimeEnv);
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
@@ -341,12 +441,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (fromExtraArgs.length > 0) return fromExtraArgs;
     return asStringArray(config.args);
   })();
-  let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
-  let remoteSkillsDir: string | null = null;
-  let localSkillsDir: string | null = null;
-  let remoteRuntimeRootDir: string | null = null;
-  let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
-
   if (executionTargetIsRemote) {
     try {
       localSkillsDir = await buildGeminiSkillsDir(config);
@@ -446,10 +540,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
       }
     } catch (error) {
-      await Promise.allSettled([
-        restoreRemoteWorkspace?.(),
-        localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-      ]);
       throw error;
     }
   }
@@ -510,6 +600,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   const commandNotes = (() => {
     const notes: string[] = ["Prompt is passed to Gemini via --prompt for non-interactive execution."];
+    if (stagedSystemInstructions) {
+      notes.push(
+        `Injected deployment system instructions from ${stagedSystemInstructions.sourcePath} via an isolated per-run Gemini global GEMINI.md at ${stagedSystemInstructions.path}.`,
+      );
+    }
     notes.push("Added --approval-mode yolo for unattended execution.");
     notes.push("Set headless terminal/browser env so Gemini fails fast instead of opening interactive auth or color prompts.");
     if (executionTargetIsRemote) {
@@ -732,7 +827,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
     const initial = await runAttempt(sessionId);
     if (
       sessionId &&
@@ -750,10 +844,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return toResult(initial);
   } finally {
-    await Promise.all([
-      paperclipBridge?.stop(),
-      restoreRemoteWorkspace?.(),
-      localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-    ]);
+    await paperclipBridge?.stop();
+    await stagedSystemInstructions?.cleanup().catch(() => undefined);
+    await restoreRemoteWorkspace?.();
+    await (localSkillsDir
+      ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined)
+      : Promise.resolve());
   }
 }

@@ -47,6 +47,34 @@ export async function readDeploymentSystemInstructions(
   return { path: configuredPath, contents };
 }
 
+/**
+ * Optional Codex-only base calibration. This is deliberately separate from
+ * PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE: Codex's model_instructions_file is the
+ * vendor-facing base layer, while the canonical HIVE rulebook is delivered as
+ * developer instructions above it.
+ */
+export async function readDeploymentCodexModelInstructions(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ path: string; contents: string } | null> {
+  const configuredPath = env.PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE?.trim();
+  if (!configuredPath) return null;
+  let contents: string;
+  try {
+    contents = await fs.readFile(configuredPath, "utf8");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Configured PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE ${configuredPath} could not be read: ${reason}`,
+    );
+  }
+  if (!contents.trim()) {
+    throw new Error(
+      `Configured PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE ${configuredPath} is empty.`,
+    );
+  }
+  return { path: configuredPath, contents };
+}
+
 export interface RunProcessResult {
   exitCode: number | null;
   signal: string | null;

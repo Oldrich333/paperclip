@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 const {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -39,9 +42,11 @@ vi.mock("./acp.js", () => ({
   formatGeminiAcpFallbackMessage: (reason: string) =>
     `[paperclip] Gemini ACP default unavailable; falling back to Gemini CLI. ${reason} Set engine=acp to require ACP or engine=cli to silence this fallback.\n`,
   resolveGeminiExecutionEngineForRun: async (ctx: { config: Record<string, unknown> }) =>
-    ctx.config.engine === "acp"
-      ? { engine: "acp", explicit: true }
-      : { engine: "acp", explicit: false },
+    ctx.config.engine === "cli"
+      ? { engine: "cli", explicit: true }
+      : ctx.config.engine === "acp"
+        ? { engine: "acp", explicit: true }
+        : { engine: "acp", explicit: false },
 }));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
@@ -124,5 +129,91 @@ describe("gemini_local ACP startup fallback", () => {
     await expect(execute(ctx as never)).rejects.toThrow('Unexpected "<<"');
 
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before remote staging when the deployment rulebook is configured", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-remote-rulebook-"));
+    const sourcePath = path.join(root, "agent_rulebook.md");
+    await writeFile(sourcePath, "canonical HIVE instructions\n", "utf8");
+    const previousSource = process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+    process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = sourcePath;
+    try {
+      await expect(execute({
+        ...buildContext({ engine: "cli", cwd: root }),
+        executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/remote/workspace" },
+      } as never)).rejects.toThrow("Gemini remote execution is refused");
+      expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+    } finally {
+      if (previousSource === undefined) delete process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = previousSource;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses Gemini's native global GEMINI.md context for the CLI lane", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-system-"));
+    const sourcePath = path.join(root, "agent_rulebook.md");
+    const cwd = path.join(root, "workspace");
+    await writeFile(sourcePath, "canonical HIVE instructions\n", "utf8");
+    await mkdir(cwd, { recursive: true });
+    const previousHome = process.env.HOME;
+    const previousSource = process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = sourcePath;
+    const commandNotes: string[] = [];
+    try {
+      const ctx = {
+        ...buildContext({ engine: "cli", cwd, env: { GEMINI_API_KEY: "test-key", GEMINI_CLI_HOME: root } }),
+        onMeta: async (meta: { commandNotes?: string[] }) => commandNotes.push(...(meta.commandNotes ?? [])),
+      };
+      const result = await execute(ctx as never);
+      expect(result.exitCode).toBe(0);
+      expect(commandNotes.join("\n")).toContain("isolated per-run Gemini global GEMINI.md");
+      await expect(access(path.join(root, ".gemini", "GEMINI.md"))).rejects.toThrow();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousSource === undefined) delete process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = previousSource;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not overwrite occupied Gemini context files or fall back to a user prompt", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-system-collision-"));
+    const sourcePath = path.join(root, "agent_rulebook.md");
+    const cwd = path.join(root, "workspace");
+    const globalPath = path.join(root, ".gemini", "GEMINI.md");
+    const projectPath = path.join(cwd, "GEMINI.md");
+    await mkdir(path.dirname(globalPath), { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeFile(sourcePath, "canonical HIVE instructions\n", "utf8");
+    await writeFile(globalPath, "existing global instructions\n", "utf8");
+    await writeFile(projectPath, "existing project instructions\n", "utf8");
+    const previousHome = process.env.HOME;
+    const previousSource = process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = sourcePath;
+    const metadata: Array<{ commandNotes?: string[]; prompt?: string }> = [];
+    try {
+      const ctx = {
+        ...buildContext({ engine: "cli", cwd, env: { GEMINI_API_KEY: "test-key", GEMINI_CLI_HOME: root } }),
+        onMeta: async (meta: { commandNotes?: string[]; prompt?: string }) => {
+          metadata.push(meta);
+        },
+      };
+      const result = await execute(ctx as never);
+      expect(result.exitCode).toBe(0);
+      expect(await readFile(globalPath, "utf8")).toBe("existing global instructions\n");
+      expect(await readFile(projectPath, "utf8")).toBe("existing project instructions\n");
+      expect(metadata[0]?.prompt).not.toContain("canonical HIVE instructions");
+      expect(metadata[0]?.commandNotes?.join("\n")).toContain("isolated per-run Gemini global GEMINI.md");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousSource === undefined) delete process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = previousSource;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

@@ -36,6 +36,7 @@ import {
   refreshPaperclipWorkspaceEnvForExecution,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
+  readDeploymentSystemInstructions,
   resolvePaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
   renderTemplate,
@@ -131,6 +132,57 @@ async function buildCursorSkillsDir(config: Record<string, unknown>): Promise<st
   return target;
 }
 
+type StagedCursorSystemRule = {
+  path: string;
+  cleanup: () => Promise<void>;
+};
+
+/**
+ * Cursor Agent has no system-prompt or --rules CLI flag. Its supported global
+ * rule channel for a workspace is `.cursor/rules/*.mdc`; an always-applied
+ * rule is therefore staged for this invocation only. The source remains the
+ * deployment-owned rulebook file, never agent configuration.
+ */
+async function stageCursorSystemRule(
+  cwd: string,
+  runId: string,
+): Promise<{ sourcePath: string; staged: StagedCursorSystemRule } | null> {
+  const systemInstructions = await readDeploymentSystemInstructions();
+  if (!systemInstructions) return null;
+  const safeRunId = runId.replace(/[^a-zA-Z0-9._-]/g, "-") || "run";
+  const rulesDir = path.join(cwd, ".cursor", "rules");
+  const rulePath = path.join(rulesDir, `paperclip-system-${safeRunId}.mdc`);
+  const rulesDirExisted = await fs.access(rulesDir).then(() => true).catch(() => false);
+  try {
+    await fs.mkdir(rulesDir, { recursive: true });
+    await fs.writeFile(
+      rulePath,
+      [
+        "---",
+        "description: HIVE deployment system instructions",
+        "alwaysApply: true",
+        "---",
+        systemInstructions.contents.trimEnd(),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+  } catch (error) {
+    await fs.rm(rulePath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  return {
+    sourcePath: systemInstructions.path,
+    staged: {
+      path: rulePath,
+      cleanup: async () => {
+        await fs.rm(rulePath, { force: true });
+        if (!rulesDirExisted) await fs.rm(rulesDir, { recursive: false, force: true }).catch(() => undefined);
+      },
+    },
+  };
+}
+
 type EnsureCursorSkillsInjectedOptions = {
   skillsDir?: string | null;
   skillsEntries?: Array<{ key: string; runtimeName: string; source: string }>;
@@ -201,6 +253,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const deploymentSystemInstructions = await readDeploymentSystemInstructions();
+  if (executionTargetIsRemote && deploymentSystemInstructions) {
+    throw new Error(
+      "Cursor remote execution is refused while PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE is configured; Paperclip has no proven remote native rules cleanup lifecycle.",
+    );
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -347,7 +405,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let localSkillsDir: string | null = null;
   let remoteRuntimeRootDir: string | null = null;
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  let stagedSystemRule: { sourcePath: string; staged: StagedCursorSystemRule } | null = null;
 
+  try {
   if (executionTargetIsRemote) {
     try {
       localSkillsDir = await buildCursorSkillsDir(config);
@@ -411,12 +471,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
       }
     } catch (error) {
-      await Promise.allSettled([
-        restoreRemoteWorkspace?.(),
-        localSkillsDir ? fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-      ]);
+      await restoreRemoteWorkspace?.().catch(() => undefined);
+      await (localSkillsDir
+        ? fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined)
+        : Promise.resolve());
       throw error;
     }
+  } else {
+    stagedSystemRule = await stageCursorSystemRule(cwd, runId);
   }
   const finalSandboxCommand = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox"
     ? await prepareCursorSandboxCommand({
@@ -515,6 +577,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   const commandNotes = (() => {
     const notes: string[] = [];
+    if (stagedSystemRule) {
+      notes.push(
+        `Injected deployment system instructions from ${stagedSystemRule.sourcePath} via Cursor workspace rule ${stagedSystemRule.staged.path} (alwaysApply=true).`,
+      );
+    }
     if (autoTrustEnabled) {
       notes.push("Auto-added --yolo to bypass interactive prompts.");
     }
@@ -729,7 +796,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
     const initial = await runAttempt(sessionId);
     if (
       sessionId &&
@@ -749,6 +815,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (paperclipBridge) {
       await paperclipBridge.stop();
     }
+    await stagedSystemRule?.staged.cleanup().catch(() => undefined);
     if (restoreRemoteWorkspace) {
       await onLog(
         "stdout",

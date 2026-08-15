@@ -103,6 +103,25 @@ describe("buildCodexExecArgs", () => {
     ]);
   });
 
+  it("keeps the HIVE Codex base calibration separate from the developer rulebook", () => {
+    const result = buildCodexExecArgs({}, {
+      modelInstructionsFile: "/opt/hive-prompts/codex_model_instructions.md",
+      systemInstructions: "shared contract",
+    });
+
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "-c",
+      'model_instructions_file="/opt/hive-prompts/codex_model_instructions.md"',
+      "-c",
+      'developer_instructions="shared contract"',
+      "-c",
+      "project_doc_max_bytes=0",
+      "-",
+    ]);
+  });
+
   it("ignores fast mode for unsupported models", () => {
     const result = buildCodexExecArgs({
       model: "gpt-5.3-codex-spark",

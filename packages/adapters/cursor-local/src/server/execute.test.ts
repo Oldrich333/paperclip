@@ -137,6 +137,96 @@ function createFreshLeaseSandboxRunner(options: {
 }
 
 describe("cursor execute", () => {
+  it("fails closed before remote staging when the deployment rulebook is configured", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-remote-rulebook-"));
+    const rulebook = path.join(root, "agent_rulebook.md");
+    await fs.writeFile(rulebook, "canonical HIVE instructions\n", "utf8");
+    const previousSource = process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+    process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = rulebook;
+    try {
+      await expect(execute({
+        runId: "cursor-remote-rulebook-run",
+        agent: { id: "agent-1", companyId: "company-1", name: "Cursor", adapterType: "cursor", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/remote/workspace" },
+        config: { cwd: root, promptTemplate: "run" },
+        context: {},
+        onLog: async () => {},
+      } as never)).rejects.toThrow("Cursor remote execution is refused");
+      expect(setPrepareCursorSandboxCommand).not.toHaveBeenCalled();
+    } finally {
+      if (previousSource === undefined) delete process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = previousSource;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("delivers the deployment rulebook through a temporary always-applied Cursor workspace rule", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-rulebook-"));
+    const workspace = path.join(root, "workspace");
+    const rulebook = path.join(root, "agent_rulebook.md");
+    const capture = path.join(root, "captured-rule.mdc");
+    const command = path.join(root, "agent");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(rulebook, "canonical HIVE instructions\n", "utf8");
+    await fs.writeFile(
+      command,
+      `#!/bin/sh
+rule=$(find .cursor/rules -name '*.mdc' -type f | head -n 1)
+if [ -n "$rule" ]; then cat "$rule" > ${JSON.stringify(capture)}; fi
+printf '%s\\n' '{"type":"system","subtype":"init","session_id":"cursor-rulebook-session","model":"auto"}'
+printf '%s\\n' '{"type":"result","subtype":"success","session_id":"cursor-rulebook-session","result":"ok"}'
+`,
+      "utf8",
+    );
+    await fs.chmod(command, 0o755);
+    setPrepareCursorSandboxCommand.mockResolvedValue({
+      command,
+      env: {},
+      remoteSystemHomeDir: null,
+      addedPathEntry: null,
+      preferredCommandPath: null,
+    });
+    const previousSource = process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+    process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = rulebook;
+    const commandNotes: string[] = [];
+    try {
+      const result = await execute({
+        runId: "cursor-rulebook-run",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Cursor Coder",
+          adapterType: "cursor",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: { command, cwd: workspace, promptTemplate: "run" },
+        context: {},
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          commandNotes.push(...(meta.commandNotes ?? []));
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(await fs.readFile(capture, "utf8")).toContain("canonical HIVE instructions");
+      expect(await fs.readFile(capture, "utf8")).toContain("alwaysApply: true");
+      expect(commandNotes.join("\n")).toContain("Cursor workspace rule");
+      await expect(
+        fs.access(path.join(workspace, ".cursor", "rules", "paperclip-system-cursor-rulebook-run.mdc")),
+      ).rejects.toThrow();
+    } finally {
+      if (previousSource === undefined) delete process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = previousSource;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("installs the default agent command on a fresh sandbox lease before execution", async () => {
     setPrepareCursorSandboxCommand.mockReset();
     setPrepareCursorSandboxCommand.mockImplementation(async (input) => {

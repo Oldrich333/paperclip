@@ -35,6 +35,7 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   readDeploymentSystemInstructions,
+  readDeploymentCodexModelInstructions,
   resolvePaperclipDesiredSkillNames,
   renderTemplate,
   renderPaperclipWakePrompt,
@@ -438,8 +439,28 @@ export async function ensureCodexSkillsInjected(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  // Resolve deployment-owned instruction sources and the execution target
+  // before consulting ACP. ACP has no proven native seam for these layers, so
+  // auto mode must select CLI and an explicit ACP request must fail closed.
+  const deploymentSystemInstructions = await readDeploymentSystemInstructions();
+  const modelInstructions = await readDeploymentCodexModelInstructions();
+  const executionTarget = readAdapterExecutionTarget({
+    executionTarget: ctx.executionTarget,
+    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+  });
+  const deploymentInstructionsConfigured = Boolean(deploymentSystemInstructions || modelInstructions);
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
-  if (engineSelection.engine === "acp") {
+  if (engineSelection.engine === "acp" && deploymentInstructionsConfigured) {
+    if (engineSelection.explicit) {
+      throw new Error(
+        "Codex ACP cannot receive PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE or PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE through a native system context; refusing to run without the configured deployment instruction layers. Set engine=cli.",
+      );
+    }
+    await ctx.onLog(
+      "stderr",
+      "[paperclip] Codex deployment instruction layers require the CLI native configuration path; bypassing auto-selected ACP and using CLI.\n",
+    );
+  } else if (engineSelection.engine === "acp") {
     try {
       return await executeCodexAcp(ctx);
     } catch (err) {
@@ -451,7 +472,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   }
-  if (!engineSelection.explicit && engineSelection.fallbackReason) {
+  if (!engineSelection.explicit && engineSelection.fallbackReason && !deploymentInstructionsConfigured) {
     await ctx.onLog("stderr", formatCodexAcpFallbackMessage(engineSelection.fallbackReason));
   }
 
@@ -495,11 +516,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   const envConfig = parseObject(config.env);
-  const executionTarget = readAdapterExecutionTarget({
-    executionTarget: ctx.executionTarget,
-    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
-  });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  if (executionTargetIsRemote && modelInstructions) {
+    throw new Error(
+      "Codex remote execution is refused while PAPERCLIP_CODEX_MODEL_INSTRUCTIONS_FILE is configured; Paperclip has no proven remote model-instructions cleanup lifecycle.",
+    );
+  }
   const configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
@@ -901,9 +923,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
       }
     }
-    const systemInstructions = await readDeploymentSystemInstructions();
-    const repoAgentsNote = systemInstructions
-      ? `Injected deployment system instructions from ${systemInstructions.path} via Codex developer_instructions and disabled workspace AGENTS.md discovery.`
+    const modelInstructionsFile = modelInstructions?.path ?? null;
+    const repoAgentsNote = deploymentSystemInstructions
+      ? `Injected deployment system instructions from ${deploymentSystemInstructions.path} via Codex developer_instructions and disabled workspace AGENTS.md discovery.`
       : "Codex exec automatically applies repo-scoped AGENTS.md instructions from the current workspace; Paperclip does not currently suppress that discovery.";
     const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
     const templateData = {
@@ -984,6 +1006,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
       return notes;
     })();
+    if (modelInstructions) {
+      commandNotes.unshift(
+        `Injected Codex model/base instructions from ${modelInstructions.path} via model_instructions_file.`,
+      );
+    }
     if (executionTargetIsSandbox) {
       commandNotes.push(
         "Added --skip-git-repo-check for sandbox execution because Codex requires an explicit trust bypass in headless remote workspaces.",
@@ -1019,7 +1046,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         {
           resumeSessionId,
           skipGitRepoCheck: executionTargetIsSandbox,
-          systemInstructions: systemInstructions?.contents,
+          systemInstructions: deploymentSystemInstructions?.contents,
+          modelInstructionsFile,
         },
       );
       const args = execArgs.args;
