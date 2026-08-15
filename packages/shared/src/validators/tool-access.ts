@@ -310,6 +310,12 @@ export const upsertToolCatalogEntrySchema = z.object({
 
 export type UpsertToolCatalogEntry = z.infer<typeof upsertToolCatalogEntrySchema>;
 
+export const retireToolCatalogEntriesSchema = z.object({
+  toolNames: z.array(z.string().trim().min(1).max(240)).min(1).max(250),
+});
+
+export type RetireToolCatalogEntries = z.infer<typeof retireToolCatalogEntriesSchema>;
+
 export const createToolProfileSchema = z.object({
   profileKey: z.string().trim().min(1).max(160).regex(safeKeyPattern),
   name: z.string().trim().min(1).max(160),

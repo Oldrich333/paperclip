@@ -23,6 +23,7 @@ import {
   duplicateToolProfileSchema,
   finishToolAppSchema,
   reconnectToolAppSchema,
+  retireToolCatalogEntriesSchema,
   reviewToolProfileNewToolsSchema,
   createToolTrustRuleFromActionRequestSchema,
   importMcpJsonSchema,
@@ -845,6 +846,16 @@ export function toolAccessRoutes(
     assertToolAppMutationAccess(req, existing.companyId);
     res.json(await svc.refreshCatalog(existing.id, getActorInfo(req)));
   });
+
+  router.post(
+    "/tool-connections/:connectionId/catalog/retire",
+    validate(retireToolCatalogEntriesSchema),
+    async (req, res) => {
+      const existing = await svc.getConnection(req.params.connectionId as string);
+      assertToolAppMutationAccess(req, existing.companyId);
+      res.json(await svc.retireCatalogEntries(existing.id, req.body.toolNames, getActorInfo(req)));
+    },
+  );
 
   router.get("/tool-connections/:connectionId/catalog", async (req, res) => {
     assertBoard(req);
