@@ -36,7 +36,7 @@ import {
   toolRuntimeSlots,
   toolStdioCommandTemplates,
 } from "@paperclipai/db";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -965,167 +965,10 @@ describeEmbeddedPostgres("tool access service", () => {
       .where(eq(toolCatalogEntries.connectionId, connection.id));
     expect(catalogAfterRemoval).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ toolName: "search_notes", status: "quarantined" }),
+        expect.objectContaining({ toolName: "search_notes", status: "removed" }),
         expect.objectContaining({ toolName: "send_email", status: "quarantined" }),
       ]),
     );
-
-    fetchMock.mockResolvedValueOnce(mcpHttpResponse({
-      jsonrpc: "2.0",
-      id: "paperclip-catalog-refresh",
-      result: { tools: [] },
-    }));
-    const emptyRefresh = await service.refreshCatalog(connection.id);
-    expect(emptyRefresh.discoveredCount).toBe(0);
-    const catalogAfterEmpty = await db
-      .select()
-      .from(toolCatalogEntries)
-      .where(eq(toolCatalogEntries.connectionId, connection.id));
-    expect(catalogAfterEmpty).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ toolName: "search_notes", status: "quarantined" }),
-        expect.objectContaining({ toolName: "send_email", status: "quarantined" }),
-      ]),
-    );
-
-    fetchMock.mockRejectedValueOnce(new Error("transient provider failure"));
-    await expect(service.refreshCatalog(connection.id)).rejects.toThrow("transient provider failure");
-    const catalogAfterTransientFailure = await db
-      .select()
-      .from(toolCatalogEntries)
-      .where(eq(toolCatalogEntries.connectionId, connection.id));
-    expect(catalogAfterTransientFailure).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ toolName: "search_notes", status: "quarantined" }),
-        expect.objectContaining({ toolName: "send_email", status: "quarantined" }),
-      ]),
-    );
-  });
-
-  it("retires exact catalog names atomically without requiring an online connection", async () => {
-    const company = await createCompany(db);
-    const service = toolAccessService(db);
-    const fetchMock = mockToolsList([
-      { name: "alpha_read", annotations: { readOnlyHint: true } },
-      { name: "beta_write", annotations: { readOnlyHint: false } },
-    ]);
-    const connection = await service.createConnection(company.id, {
-      name: "Retirement fixture",
-      transport: "mcp_remote",
-      config: { url: "https://fixture.example/mcp" },
-      enabled: true,
-      status: "active",
-    });
-    await service.refreshCatalog(connection.id);
-    await db
-      .update(toolCatalogEntries)
-      .set({ status: "quarantined", quarantineReason: "pending_review", quarantinedAt: new Date() })
-      .where(and(eq(toolCatalogEntries.connectionId, connection.id), eq(toolCatalogEntries.toolName, "beta_write")));
-
-    fetchMock.mockResolvedValueOnce(mcpHttpResponse({
-      jsonrpc: "2.0",
-      id: "paperclip-catalog-refresh",
-      result: { tools: [{ name: "alpha_read", annotations: { readOnlyHint: true } }] },
-    }));
-    const otherConnection = await service.createConnection(company.id, {
-      name: "Other retirement fixture",
-      transport: "mcp_remote",
-      config: { url: "https://other-fixture.example/mcp" },
-      enabled: true,
-      status: "active",
-    });
-    await service.refreshCatalog(otherConnection.id);
-
-    await expect(service.retireCatalogEntries(connection.id, ["alpha_read", "missing_read"]))
-      .rejects.toMatchObject({ status: 400, details: { code: "catalog_entries_not_found" } });
-    expect(
-      await db
-        .select({ status: toolCatalogEntries.status })
-        .from(toolCatalogEntries)
-        .where(and(eq(toolCatalogEntries.connectionId, connection.id), eq(toolCatalogEntries.toolName, "alpha_read")))
-        .then((rows) => rows[0]?.status),
-    ).toBe("active");
-
-    await db
-      .update(toolConnections)
-      .set({ enabled: false, status: "disabled", healthStatus: "error" })
-      .where(eq(toolConnections.id, connection.id));
-    const retiredResponse = await request(createRouteApp(db))
-      .post(`/api/tool-connections/${connection.id}/catalog/retire`)
-      .send({ toolNames: ["beta_write", "alpha_read"] });
-    expect(retiredResponse.status).toBe(200);
-    const retired = retiredResponse.body;
-    expect(retired).toMatchObject({ retiredCount: 2, alreadyRemovedCount: 0 });
-    expect(retired.catalog.map((entry) => [entry.toolName, entry.status]).sort()).toEqual([
-      ["alpha_read", "removed"],
-      ["beta_write", "removed"],
-    ]);
-    expect(
-      await db
-        .select({ status: toolCatalogEntries.status })
-        .from(toolCatalogEntries)
-        .where(and(eq(toolCatalogEntries.connectionId, otherConnection.id), eq(toolCatalogEntries.toolName, "alpha_read")))
-        .then((rows) => rows[0]?.status),
-    ).toBe("active");
-
-    const repeated = await service.retireCatalogEntries(connection.id, ["alpha_read", "beta_write"]);
-    expect(repeated).toMatchObject({ retiredCount: 0, alreadyRemovedCount: 2 });
-    expect(await db
-      .select()
-      .from(toolAccessAuditEvents)
-      .where(and(
-        eq(toolAccessAuditEvents.connectionId, connection.id),
-        eq(toolAccessAuditEvents.action, "tool_catalog.entries_retired"),
-      ))
-      .then((rows) => rows.length)).toBe(2);
-  });
-
-  it("rolls catalog retirement back when its audit insert fails", async () => {
-    const company = await createCompany(db);
-    const service = toolAccessService(db);
-    mockToolsList([{ name: "rollback_read", annotations: { readOnlyHint: true } }]);
-    const connection = await service.createConnection(company.id, {
-      name: "Retirement rollback fixture",
-      transport: "mcp_remote",
-      config: { url: "https://fixture.example/mcp" },
-      enabled: true,
-      status: "active",
-    });
-    await service.refreshCatalog(connection.id);
-
-    await db.execute(sql.raw(`
-      CREATE OR REPLACE FUNCTION paperclip_test_fail_retire_audit() RETURNS trigger
-      LANGUAGE plpgsql AS $$
-      BEGIN
-        IF NEW.action = 'tool_catalog.entries_retired' THEN
-          RAISE EXCEPTION 'fixture audit failure';
-        END IF;
-        RETURN NEW;
-      END
-      $$
-    `));
-    await db.execute(sql.raw(`
-      CREATE TRIGGER paperclip_test_fail_retire_audit_trigger
-      BEFORE INSERT ON tool_access_audit_events
-      FOR EACH ROW EXECUTE FUNCTION paperclip_test_fail_retire_audit()
-    `));
-    try {
-      await expect(service.retireCatalogEntries(connection.id, ["rollback_read"]))
-        .rejects.toThrow('Failed query: insert into "tool_access_audit_events"');
-    } finally {
-      await db.execute(sql.raw(
-        "DROP TRIGGER IF EXISTS paperclip_test_fail_retire_audit_trigger ON tool_access_audit_events",
-      ));
-      await db.execute(sql.raw("DROP FUNCTION IF EXISTS paperclip_test_fail_retire_audit()"));
-    }
-
-    expect(
-      await db
-        .select({ status: toolCatalogEntries.status })
-        .from(toolCatalogEntries)
-        .where(and(eq(toolCatalogEntries.connectionId, connection.id), eq(toolCatalogEntries.toolName, "rollback_read")))
-        .then((rows) => rows[0]?.status),
-    ).toBe("active");
   });
 
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {
@@ -5237,9 +5080,6 @@ describeEmbeddedPostgres("tool access service", () => {
       await request(viewerApp)
         .post(`/api/tool-connections/${connection.id}/catalog/refresh`)
         .send({}),
-      await request(viewerApp)
-        .post(`/api/tool-connections/${connection.id}/catalog/retire`)
-        .send({ toolNames: ["viewer_read"] }),
     ];
 
     for (const res of responses) {

@@ -2942,6 +2942,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     const existingRows = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connection.id));
     const existingByName = new Map(existingRows.map((entry) => [entry.toolName, entry]));
+    const discoveredNames = new Set(descriptors.map((descriptor) => descriptor.name));
+    const removedIds = existingRows
+      .filter((entry) => entry.status !== "removed" && !discoveredNames.has(entry.toolName))
+      .map((entry) => entry.id);
+    if (removedIds.length > 0) {
+      await db
+        .update(toolCatalogEntries)
+        .set({
+          status: "removed",
+          quarantinedAt: null,
+          quarantineReason: null,
+          updatedAt: now,
+        })
+        .where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, removedIds)));
+    }
     const updatedEntries: ToolCatalogEntry[] = [];
     let quarantinedCount = 0;
     const quarantineOnRefresh = shouldQuarantineNewEntries(connection) && connection.status === "active";
@@ -3044,7 +3059,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       connectionId: connection.id,
       action: "tool_connection.catalog_refresh",
       outcome: "success",
-      details: { discoveredCount: descriptors.length, quarantinedCount },
+      details: { discoveredCount: descriptors.length, quarantinedCount, removedCount: removedIds.length },
       actor,
     });
 
@@ -3054,106 +3069,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       discoveredCount: descriptors.length,
       quarantinedCount,
     };
-  }
-
-  async function retireCatalogEntries(
-    connectionId: string,
-    toolNames: string[],
-    actor?: ActorInfo,
-  ) {
-    const connection = await getConnectionRow(connectionId);
-    const requestedNames = toolNames.map((name) => name.trim()).sort();
-    if (requestedNames.length === 0 || requestedNames.some((name) => name.length === 0)) {
-      throw badRequest("At least one tool name is required");
-    }
-    if (requestedNames.length > 250 || requestedNames.some((name) => name.length > 240)) {
-      throw badRequest("At most 250 tool names of up to 240 characters may be retired at once");
-    }
-    if (new Set(requestedNames).size !== requestedNames.length) {
-      throw badRequest("Tool names must be unique");
-    }
-
-    let auditWriteFailed = false;
-    try {
-      const result = await db.transaction(async (tx) => {
-        const rows = await tx
-          .select()
-          .from(toolCatalogEntries)
-          .where(and(
-            eq(toolCatalogEntries.connectionId, connection.id),
-            inArray(toolCatalogEntries.toolName, requestedNames),
-          ));
-        const foundNames = new Set(rows.map((row) => row.toolName));
-        const missingToolNames = requestedNames.filter((name) => !foundNames.has(name));
-        if (missingToolNames.length > 0) {
-          throw badRequest("Every retired tool must exist on the selected connection", {
-            code: "catalog_entries_not_found",
-            missingToolNames,
-          });
-        }
-
-        const retireIds = rows.filter((row) => row.status !== "removed").map((row) => row.id);
-        const retiredRows = retireIds.length > 0
-          ? await tx
-            .update(toolCatalogEntries)
-            .set({
-              status: "removed",
-              quarantinedAt: null,
-              quarantineReason: null,
-              updatedAt: new Date(),
-            })
-            .where(and(
-              eq(toolCatalogEntries.connectionId, connection.id),
-              inArray(toolCatalogEntries.id, retireIds),
-              ne(toolCatalogEntries.status, "removed"),
-            ))
-            .returning()
-          : [];
-        const catalog = await tx
-          .select()
-          .from(toolCatalogEntries)
-          .where(and(
-            eq(toolCatalogEntries.connectionId, connection.id),
-            inArray(toolCatalogEntries.toolName, requestedNames),
-          ));
-
-        try {
-          await tx.insert(toolAccessAuditEvents).values({
-            companyId: connection.companyId,
-            connectionId: connection.id,
-            actorType: actor?.actorType ?? "system",
-            actorId: actor?.actorId ?? null,
-            action: "tool_catalog.entries_retired",
-            outcome: "success",
-            details: {
-              toolNames: requestedNames,
-              retiredCount: retiredRows.length,
-              alreadyRemovedCount: rows.length - retiredRows.length,
-            },
-          });
-        } catch (error) {
-          auditWriteFailed = true;
-          throw error;
-        }
-
-        return {
-          catalog,
-          retiredCount: retiredRows.length,
-          alreadyRemovedCount: rows.length - retiredRows.length,
-        };
-      });
-      return {
-        connection: toConnection(connection),
-        retiredCount: result.retiredCount,
-        alreadyRemovedCount: result.alreadyRemovedCount,
-        catalog: result.catalog.map((row) => toCatalogEntryForConnection(row, connection)),
-      };
-    } catch (error) {
-      if (auditWriteFailed) {
-        await recordToolRuntimeAuditWriteFailure(db, connection.companyId);
-      }
-      throw error;
-    }
   }
 
   async function listAppsNeedingAttention(companyId: string): Promise<ToolAppsAttentionResponse> {
@@ -5965,8 +5880,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     checkHealth: checkConnectionHealth,
 
     refreshCatalog,
-
-    retireCatalogEntries,
 
     listAppsNeedingAttention,
 

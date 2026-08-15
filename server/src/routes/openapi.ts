@@ -178,7 +178,6 @@ import {
   disableToolStdioCommandTemplateSchema,
   finishToolAppSchema,
   reconnectToolAppSchema,
-  retireToolCatalogEntriesSchema,
   updateToolConnectionSchema,
   putToolConnectionInstallsSchema,
   toolConnectionTestCallSchema,
@@ -785,7 +784,6 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/tool-connections/{connectionId}/health-check",
   "POST /api/tool-connections/{connectionId}/reconnect",
   "POST /api/tool-connections/{connectionId}/catalog/refresh",
-  "POST /api/tool-connections/{connectionId}/catalog/retire",
   "GET /api/tool-connections/{connectionId}/catalog",
   "GET /api/tool-connections/{connectionId}/activity",
   "GET /api/tool-connections/{connectionId}/test-agents",
@@ -6121,14 +6119,6 @@ registerCurrentRoute({
   path: "/api/tool-connections/{connectionId}/catalog/refresh",
   tags: ["tool-access"],
   summary: "Refresh a tool connection catalog",
-});
-
-registerCurrentRoute({
-  method: "post",
-  path: "/api/tool-connections/{connectionId}/catalog/retire",
-  tags: ["tool-access"],
-  summary: "Explicitly retire exact tools from one connection catalog",
-  body: retireToolCatalogEntriesSchema,
 });
 
 registerCurrentRoute({
