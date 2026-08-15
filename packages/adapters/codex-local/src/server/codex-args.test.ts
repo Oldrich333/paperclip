@@ -89,6 +89,20 @@ describe("buildCodexExecArgs", () => {
     ]);
   });
 
+  it("delivers deployment instructions natively and suppresses workspace discovery", () => {
+    const result = buildCodexExecArgs({}, { systemInstructions: "shared contract" });
+
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "-c",
+      'developer_instructions="shared contract"',
+      "-c",
+      "project_doc_max_bytes=0",
+      "-",
+    ]);
+  });
+
   it("ignores fast mode for unsupported models", () => {
     const result = buildCodexExecArgs({
       model: "gpt-5.3-codex-spark",

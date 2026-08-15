@@ -15,6 +15,38 @@ import type {
   AdapterSkillSnapshot,
 } from "./types.js";
 
+/**
+ * Reads the optional, deployment-owned system-instructions file once for an
+ * adapter invocation. The file path is deliberately supplied by the server
+ * environment rather than an agent configuration: individual agents may add
+ * role instructions, but they cannot replace the platform contract.
+ *
+ * When the deployment opts in, a missing or empty file is an error. Silently
+ * continuing would create runs without the common instruction layer.
+ */
+export async function readDeploymentSystemInstructions(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ path: string; contents: string } | null> {
+  const configuredPath = env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE?.trim();
+  if (!configuredPath) return null;
+
+  let contents: string;
+  try {
+    contents = await fs.readFile(configuredPath, "utf8");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Configured PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE ${configuredPath} could not be read: ${reason}`,
+    );
+  }
+  if (!contents.trim()) {
+    throw new Error(
+      `Configured PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE ${configuredPath} is empty.`,
+    );
+  }
+  return { path: configuredPath, contents };
+}
+
 export interface RunProcessResult {
   exitCode: number | null;
   signal: string | null;

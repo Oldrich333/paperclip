@@ -65,6 +65,29 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await expect(fs.access(prepared.env.XDG_CONFIG_HOME)).rejects.toThrow();
   });
 
+  it("materializes deployment-owned system instructions as global OpenCode rules", async () => {
+    const configHome = await makeConfigHome();
+    const rulebookPath = path.join(configHome, "agent_rulebook.md");
+    await fs.writeFile(rulebookPath, "one shared contract\n", "utf8");
+    const previous = process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+    process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = rulebookPath;
+    try {
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: { dangerouslySkipPermissions: false },
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      await expect(
+        fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "AGENTS.md"), "utf8"),
+      ).resolves.toBe("one shared contract\n");
+      expect(prepared.notes.some((note) => note.includes("deployment system instructions"))).toBe(true);
+      await prepared.cleanup();
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE;
+      else process.env.PAPERCLIP_SYSTEM_INSTRUCTIONS_FILE = previous;
+    }
+  });
+
   it("merges custom providers from PAPERCLIP_OPENCODE_PROVIDERS into the config", async () => {
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
     const providers = {

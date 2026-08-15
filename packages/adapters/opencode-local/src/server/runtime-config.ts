@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import { asBoolean, readDeploymentSystemInstructions } from "@paperclipai/adapter-utils/server-utils";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -100,7 +100,11 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   targetIsRemote?: boolean;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
+  // The global OpenCode rules file is the supported system-wide rule channel.
+  // It is materialized only in the per-run runtime config directory from the
+  // deployment-owned source, never taken from an individual agent config.
+  const systemInstructions = await readDeploymentSystemInstructions();
+  if (!skipPermissions && !systemInstructions) {
     return {
       env: input.env,
       notes: [],
@@ -144,9 +148,12 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   const existingPermission = isPlainObject(existingConfig.permission)
     ? existingConfig.permission
     : {};
-  const notes = [
-    "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
-  ];
+  const notes: string[] = [];
+  if (skipPermissions) {
+    notes.push(
+      "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
+    );
+  }
 
   // Merge gateway/custom provider definitions supplied via PAPERCLIP_OPENCODE_PROVIDERS
   // (a JSON object in OpenCode's `provider` shape). OpenCode resolves a `--model
@@ -171,13 +178,13 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     );
   }
 
-  const nextConfig: Record<string, unknown> = {
-    ...existingConfig,
-    permission: {
+  const nextConfig: Record<string, unknown> = { ...existingConfig };
+  if (skipPermissions) {
+    nextConfig.permission = {
       ...existingPermission,
       external_directory: "allow",
-    },
-  };
+    };
+  }
   if (Object.keys(nextProvider).length > 0) {
     nextConfig.provider = nextProvider;
   }
@@ -192,6 +199,13 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   if (smallModel) {
     nextConfig.small_model = smallModel;
     notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
+  }
+  if (systemInstructions) {
+    const rulesPath = path.join(runtimeConfigDir, "AGENTS.md");
+    await fs.writeFile(rulesPath, systemInstructions.contents, "utf8");
+    notes.push(
+      `Injected deployment system instructions from ${systemInstructions.path} as OpenCode global rules.`,
+    );
   }
   await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
 

@@ -34,6 +34,7 @@ import {
   refreshPaperclipWorkspaceEnvForExecution,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
+  readDeploymentSystemInstructions,
   resolvePaperclipDesiredSkillNames,
   renderTemplate,
   renderPaperclipWakePrompt,
@@ -900,8 +901,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
       }
     }
-    const repoAgentsNote =
-      "Codex exec automatically applies repo-scoped AGENTS.md instructions from the current workspace; Paperclip does not currently suppress that discovery.";
+    const systemInstructions = await readDeploymentSystemInstructions();
+    const repoAgentsNote = systemInstructions
+      ? `Injected deployment system instructions from ${systemInstructions.path} via Codex developer_instructions and disabled workspace AGENTS.md discovery.`
+      : "Codex exec automatically applies repo-scoped AGENTS.md instructions from the current workspace; Paperclip does not currently suppress that discovery.";
     const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
     const templateData = {
       agentId: agent.id,
@@ -1016,6 +1019,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         {
           resumeSessionId,
           skipGitRepoCheck: executionTargetIsSandbox,
+          systemInstructions: systemInstructions?.contents,
         },
       );
       const args = execArgs.args;

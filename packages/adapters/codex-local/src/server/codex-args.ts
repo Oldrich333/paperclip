@@ -33,6 +33,8 @@ export function buildCodexExecArgs(
   options: {
     resumeSessionId?: string | null;
     skipGitRepoCheck?: boolean;
+    /** Deployment-owned instructions delivered through Codex's native config. */
+    systemInstructions?: string | null;
   } = {},
 ): BuildCodexExecArgsResult {
   const record = asRecord(config);
@@ -60,6 +62,16 @@ export function buildCodexExecArgs(
   }
   if (fastModeApplied) {
     args.push("-c", 'service_tier="fast"', "-c", "features.fast_mode=true");
+  }
+  if (options.systemInstructions?.trim()) {
+    args.push(
+      "-c",
+      `developer_instructions=${JSON.stringify(options.systemInstructions)}`,
+      // System instructions are authoritative for programmatic Paperclip runs;
+      // do not additionally discover a workspace AGENTS.md.
+      "-c",
+      "project_doc_max_bytes=0",
+    );
   }
   if (extraArgs.length > 0) args.push(...extraArgs);
   if (options.resumeSessionId) args.push("resume", options.resumeSessionId, "-");
