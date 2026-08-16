@@ -1386,13 +1386,13 @@ export function toolAccessPolicyService(db: Db) {
       if (existing) return { invocation: existing, replayed: true, actionRequest: null };
     }
     const status = accessDecision.decision === "allow"
-      ? "authorized"
+      ? ("authorized" as const)
       : accessDecision.decision === "require_approval"
-        ? "awaiting_approval"
+        ? ("awaiting_approval" as const)
         : accessDecision.decision === "rate_limited"
-          ? "rate_limited"
-          : "denied";
-    const [invocation] = await db.insert(toolInvocations).values({
+          ? ("rate_limited" as const)
+          : ("denied" as const);
+    const invocationValues: typeof toolInvocations.$inferInsert = {
       companyId: ctx.companyId,
       idempotencyKey,
       actorType: ctx.actorType,
@@ -1419,7 +1419,20 @@ export function toolAccessPolicyService(db: Db) {
       errorCode: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.reasonCode,
       errorMessage: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.explanation,
       completedAt: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : new Date(),
-    }).returning();
+    };
+    let [invocation] = await db
+      .insert(toolInvocations)
+      .values(invocationValues)
+      .onConflictDoNothing({ target: [toolInvocations.companyId, toolInvocations.idempotencyKey] })
+      .returning();
+    if (!invocation && idempotencyKey) {
+      [invocation] = await db.select().from(toolInvocations).where(and(
+        eq(toolInvocations.companyId, input.companyId),
+        eq(toolInvocations.idempotencyKey, idempotencyKey),
+      ));
+      if (invocation) return { invocation, replayed: true, actionRequest: null };
+    }
+    if (!invocation) throw new Error("Tool invocation was not recorded");
     let actionRequest = null;
     if (accessDecision.decision === "require_approval") {
       [actionRequest] = await db.insert(toolActionRequests).values({

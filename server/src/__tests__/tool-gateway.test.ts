@@ -1998,6 +1998,162 @@ rl.on("line", (line) => {
     }
   });
 
+  it("starts long-running run_tool calls, deduplicates retries, and exposes terminal failures", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    let activeRequests = 0;
+    let maxActiveRequests = 0;
+    let failProvider = false;
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      activeRequests -= 1;
+      if (failProvider) return { status: 504, body: { error: "provider timed out" } };
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: "async ok" }] },
+        },
+      };
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "long-running-demo",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({ config: { url: fake.url, onDemandTools: { enabled: true } } })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const targetToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [targetToolName]);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const visibleTools = await gateway.listToolsForSession(session.token);
+      const runTool = visibleTools.find((tool) => tool.name === "run_tool");
+      expect(runTool?.parametersSchema).toMatchObject({
+        properties: expect.objectContaining({
+          async: expect.any(Object),
+          timeoutMs: expect.any(Object),
+          idempotencyKey: expect.any(Object),
+        }),
+      });
+      expect(visibleTools.map((tool) => tool.name)).toContain("get_tool_run");
+
+      const started = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { key: "async-key", value: "async-value" },
+          async: true,
+          timeoutMs: 1_000,
+          idempotencyKey: "long-running-1",
+        },
+      });
+      expect(started).toMatchObject({ status: "started", tool: "run_tool", targetTool: targetToolName });
+      const invocationId = started.invocationId;
+
+      for (let attempt = 0; attempt < 100 && activeRequests === 0; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const retry = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { key: "async-key", value: "async-value" },
+          async: true,
+          idempotencyKey: "long-running-1",
+        },
+      });
+      expect(retry).toMatchObject({ status: "replayed", invocationId });
+      expect(fake.requests).toHaveLength(1);
+
+      let terminalStatus: Awaited<ReturnType<typeof gateway.executeTool>>;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        terminalStatus = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: "get_tool_run",
+          parameters: { invocationId },
+        });
+        const status = (terminalStatus.result as { status?: string }).status;
+        if (["succeeded", "failed", "timed_out"].includes(status ?? "")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(terminalStatus.result).toMatchObject({ status: "succeeded", terminal: true });
+      expect(maxActiveRequests).toBe(1);
+
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: targetToolName,
+        parameters: { key: "gateway-timeout", value: "gateway-timeout" },
+        timeoutMs: 10,
+      }).then(
+        () => { throw new Error("Expected gateway timeout"); },
+        (error) => expectGatewayError(error, 504, "tool_timeout"),
+      );
+      await db.update(toolConnections)
+        .set({ healthStatus: "ok", healthMessage: null, lastError: null })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+
+      failProvider = true;
+      const failedStart = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { key: "failure-key", value: "failure-value" },
+          async: true,
+          idempotencyKey: "long-running-failure",
+        },
+      });
+      let failedStatus: Awaited<ReturnType<typeof gateway.executeTool>>;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        failedStatus = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: "get_tool_run",
+          parameters: { invocationId: failedStart.invocationId },
+        });
+        const status = (failedStatus.result as { status?: string }).status;
+        if (["succeeded", "failed", "timed_out"].includes(status ?? "")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(failedStatus.result).toMatchObject({
+        status: "failed",
+        terminal: true,
+        errorCode: "mcp_remote_status",
+      });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const [failureEvent] = await db
+          .select()
+          .from(toolCallEvents)
+          .where(eq(toolCallEvents.invocationId, failedStart.invocationId))
+          .limit(1);
+        const [failureAudit] = await db
+          .select()
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.runId, run.id),
+            eq(activityLog.action, "tool_gateway.call_failed"),
+          ))
+          .limit(1);
+        if (failureEvent && failureAudit) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("discovers and calls the SDK-backed KV demo MCP server over Streamable HTTP", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

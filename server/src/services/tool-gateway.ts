@@ -78,6 +78,9 @@ import {
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
+const ASYNC_TOOL_TIMEOUT_LIMIT_MS = 4_200_000;
+const DEFAULT_ASYNC_TOOL_TIMEOUT_MS = ASYNC_TOOL_TIMEOUT_LIMIT_MS;
+const MAX_TOOL_TIMEOUT_MS = 60_000;
 // When a human approves a parked write, the server carries it out on their
 // behalf with no interactive caller left to raise `timeoutMs`. Remote write
 // providers (e.g. Zapier Google Sheets `add_row`) routinely take longer than
@@ -438,9 +441,11 @@ function gatewaySessionFromRow(row: typeof toolGatewaySessions.$inferSelect): To
   };
 }
 
-function timeoutMs(value: number | undefined) {
-  if (!Number.isFinite(value)) return DEFAULT_TOOL_TIMEOUT_MS;
-  return Math.max(1, Math.min(60_000, Math.floor(value ?? DEFAULT_TOOL_TIMEOUT_MS)));
+function timeoutMs(value: number | undefined, allowLongRunning = false) {
+  const defaultValue = allowLongRunning ? DEFAULT_ASYNC_TOOL_TIMEOUT_MS : DEFAULT_TOOL_TIMEOUT_MS;
+  const maxValue = allowLongRunning ? ASYNC_TOOL_TIMEOUT_LIMIT_MS : MAX_TOOL_TIMEOUT_MS;
+  if (!Number.isFinite(value)) return defaultValue;
+  return Math.max(1, Math.min(maxValue, Math.floor(value ?? defaultValue)));
 }
 
 function sessionTtlMs(value: number | undefined) {
@@ -728,6 +733,22 @@ const VIRTUAL_RUN_TOOL: ToolGatewayDescriptor = {
     properties: {
       tool: { type: "string" },
       arguments: { type: "object" },
+      async: {
+        type: "boolean",
+        description: "Return immediately with an invocationId and observe completion with get_tool_run.",
+      },
+      timeoutMs: {
+        type: "integer",
+        minimum: 1_000,
+        maximum: ASYNC_TOOL_TIMEOUT_LIMIT_MS,
+        description: "Maximum provider execution time for an async run.",
+      },
+      idempotencyKey: {
+        type: "string",
+        minLength: 1,
+        maxLength: 200,
+        description: "Stable retry key; retries return the existing invocation instead of starting another run.",
+      },
     },
     required: ["tool"],
     additionalProperties: false,
@@ -737,7 +758,24 @@ const VIRTUAL_RUN_TOOL: ToolGatewayDescriptor = {
   risk: "write",
 };
 
-const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL];
+const VIRTUAL_GET_TOOL_RUN: ToolGatewayDescriptor = {
+  name: "get_tool_run",
+  displayName: "Get tool run status",
+  description: "Read the terminal or in-progress status of a previously started async tool run.",
+  parametersSchema: {
+    type: "object",
+    properties: {
+      invocationId: { type: "string", description: "The invocationId returned by run_tool." },
+    },
+    required: ["invocationId"],
+    additionalProperties: false,
+  },
+  pluginId: "paperclip-gateway",
+  providerType: "paperclip_virtual",
+  risk: "read",
+};
+
+const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL, VIRTUAL_GET_TOOL_RUN];
 
 export function createToolGatewayService(
   db: Db,
@@ -1831,7 +1869,7 @@ export function createToolGatewayService(
   async function findToolForSession(session: ToolGatewaySession, toolName: string): Promise<ToolGatewayDescriptor> {
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
-    const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
+    const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [VIRTUAL_GET_TOOL_RUN];
     const tool = [...allTools(), ...connectedTools, ...virtualTools]
       .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
       .find((candidate) => candidate.name === toolName);
@@ -1841,16 +1879,47 @@ export function createToolGatewayService(
     return tool;
   }
 
-  function virtualRunToolInput(parameters: unknown): { targetToolName: string; targetParameters: unknown } {
+  function virtualRunToolInput(parameters: unknown): {
+    targetToolName: string;
+    targetParameters: unknown;
+    asyncExecution: boolean;
+    timeoutMs?: number;
+    idempotencyKey?: string;
+  } {
     const params = asRecord(parameters) ?? {};
     const targetToolName = typeof params.tool === "string" ? params.tool.trim() : "";
     if (!targetToolName) {
       throw new ToolGatewayHttpError(400, "run_tool requires a target tool name", "invalid_parameters");
     }
+    const requestedTimeoutMs = params.timeoutMs;
+    if (requestedTimeoutMs !== undefined
+      && (typeof requestedTimeoutMs !== "number" || !Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs < 1_000)) {
+      throw new ToolGatewayHttpError(400, "run_tool timeoutMs must be at least 1000ms", "invalid_parameters");
+    }
+    if (typeof requestedTimeoutMs === "number" && requestedTimeoutMs > MAX_TOOL_TIMEOUT_MS && params.async !== true) {
+      throw new ToolGatewayHttpError(400, "run_tool timeouts above 60000ms require async=true", "invalid_parameters");
+    }
+    const requestedIdempotencyKey = params.idempotencyKey;
+    if (requestedIdempotencyKey !== undefined
+      && (typeof requestedIdempotencyKey !== "string" || requestedIdempotencyKey.trim().length === 0)) {
+      throw new ToolGatewayHttpError(400, "run_tool idempotencyKey must be a non-empty string", "invalid_parameters");
+    }
     return {
       targetToolName,
       targetParameters: params.arguments ?? {},
+      asyncExecution: params.async === true,
+      timeoutMs: typeof requestedTimeoutMs === "number" ? requestedTimeoutMs : undefined,
+      idempotencyKey: typeof requestedIdempotencyKey === "string" ? requestedIdempotencyKey.trim() : undefined,
     };
+  }
+
+  function virtualToolRunStatus(parameters: unknown): string {
+    const params = asRecord(parameters) ?? {};
+    const invocationId = typeof params.invocationId === "string" ? params.invocationId.trim() : "";
+    if (!uuidPattern.test(invocationId)) {
+      throw new ToolGatewayHttpError(400, "get_tool_run requires a valid invocationId", "invalid_parameters");
+    }
+    return invocationId;
   }
 
   async function searchableOnDemandTools(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
@@ -5310,6 +5379,50 @@ export function createToolGatewayService(
       let tool = await findToolForSession(session, input.tool);
       let virtualToolName: string | null = null;
       let requestedParameters: unknown = input.parameters ?? {};
+      let asyncExecution = false;
+      let requestedTimeoutMs = input.timeoutMs;
+      let requestedIdempotencyKey = input.idempotencyKey;
+
+      if (tool.name === "get_tool_run" && tool.providerType === "paperclip_virtual") {
+        const targetInvocationId = virtualToolRunStatus(requestedParameters);
+        const [invocation] = await db
+          .select()
+          .from(toolInvocations)
+          .where(and(
+            eq(toolInvocations.id, targetInvocationId),
+            eq(toolInvocations.companyId, session.companyId),
+          ))
+          .limit(1);
+        if (!invocation) {
+          throw new ToolGatewayHttpError(404, "Tool invocation not found", "invocation_not_found", {
+            invocationId: targetInvocationId,
+          });
+        }
+        if (
+          invocation.agentId !== session.agentId
+          || invocation.runId !== session.runId
+          || invocation.issueId !== session.issueId
+          || (session.gatewayId && invocation.gatewayId !== session.gatewayId)
+          || (session.gatewayPublicId && invocation.gatewayPublicId !== session.gatewayPublicId)
+        ) {
+          throw new ToolGatewayHttpError(403, "Tool invocation is outside the authenticated run scope", "invocation_scope_mismatch");
+        }
+        const terminal = ["succeeded", "failed", "timed_out", "rate_limited", "denied"].includes(invocation.status);
+        return {
+          invocationId: invocation.id,
+          status: "completed" as const,
+          tool: "get_tool_run",
+          result: {
+            invocationId: invocation.id,
+            tool: invocation.toolName,
+            status: invocation.status,
+            terminal,
+            result: invocation.resultSummary ?? null,
+            errorCode: invocation.errorCode ?? null,
+            errorMessage: invocation.errorMessage ?? null,
+          },
+        };
+      }
 
       if (tool.name === "search_tools" && tool.providerType === "paperclip_virtual") {
         const argumentValidation = validateToolContent({
@@ -5389,7 +5502,7 @@ export function createToolGatewayService(
       }
 
       if (tool.name === "run_tool" && tool.providerType === "paperclip_virtual") {
-        const { targetToolName, targetParameters } = virtualRunToolInput(requestedParameters);
+        const { targetToolName, targetParameters, asyncExecution: requestedAsyncExecution, timeoutMs: virtualTimeoutMs, idempotencyKey: virtualIdempotencyKey } = virtualRunToolInput(requestedParameters);
         const targetTool = await findToolForSession(session, targetToolName);
         if (!isOnDemandRemoteTool(targetTool)) {
           throw new ToolGatewayHttpError(404, `Tool "${targetToolName}" not found`, "tool_not_found", { tool: targetToolName });
@@ -5397,6 +5510,9 @@ export function createToolGatewayService(
         virtualToolName = "run_tool";
         tool = targetTool;
         requestedParameters = targetParameters;
+        asyncExecution = requestedAsyncExecution;
+        requestedTimeoutMs = virtualTimeoutMs;
+        requestedIdempotencyKey = virtualIdempotencyKey ?? requestedIdempotencyKey;
       }
 
       const argumentValidation = validateToolContent({
@@ -5630,7 +5746,7 @@ export function createToolGatewayService(
           session,
           tool,
           parameters: effectiveParameters,
-          idempotencyKey: input.idempotencyKey,
+          idempotencyKey: requestedIdempotencyKey,
           consumeRateLimit: true,
         });
         const accessDecision = await policyService.decide(decisionInput);
@@ -5654,6 +5770,23 @@ export function createToolGatewayService(
               replayed: true,
             },
           });
+          if (asyncExecution) {
+            return {
+              invocationId,
+              status: "replayed" as const,
+              tool: virtualToolName ?? tool.name,
+              targetTool: virtualToolName ? tool.name : undefined,
+              result: {
+                invocationId,
+                tool: tool.name,
+                status: recorded.invocation.status,
+                terminal: ["succeeded", "failed", "timed_out", "rate_limited", "denied"].includes(recorded.invocation.status),
+                result: recorded.invocation.resultSummary ?? null,
+                errorCode: recorded.invocation.errorCode ?? null,
+                errorMessage: recorded.invocation.errorMessage ?? null,
+              },
+            };
+          }
           return {
             invocationId,
             status: "replayed" as const,
@@ -5731,8 +5864,9 @@ export function createToolGatewayService(
         },
       });
 
-      try {
-        const executionTimeoutMs = timeoutMs(input.timeoutMs);
+      const executionTimeoutMs = timeoutMs(requestedTimeoutMs, asyncExecution);
+      const executeRecordedTool = async () => {
+       try {
         if (tool.providerType === "paperclip_plugin" && (!session.agentId || !session.runId)) {
           throw new ToolGatewayHttpError(403, "Plugin tools require an agent run context", "agent_context_required");
         }
@@ -5853,7 +5987,7 @@ export function createToolGatewayService(
           );
         const isDeferred = status === 504 || isRuntimeDeferred;
         const message = normalizedError instanceof Error ? normalizedError.message : String(normalizedError);
-        if (reasonCode === "elicitation_required") {
+        if (reasonCode === "elicitation_required" && !asyncExecution) {
           throw normalizedError;
         }
         await db
@@ -5916,7 +6050,25 @@ export function createToolGatewayService(
           throw new ToolGatewayHttpError(422, message, reasonCode, { findings: normalizedError.findings });
         }
         throw normalizedError;
+       }
+      };
+      if (asyncExecution) {
+        void executeRecordedTool().catch(() => undefined);
+        return {
+          invocationId,
+          status: "started" as const,
+          tool: virtualToolName ?? tool.name,
+          targetTool: virtualToolName ? tool.name : undefined,
+          result: {
+            invocationId,
+            tool: tool.name,
+            status: "executing",
+            terminal: false,
+            timeoutMs: executionTimeoutMs,
+          },
+        };
       }
+      return executeRecordedTool();
     },
 
     async executePluginTool(input: ExecutePluginToolInput) {
