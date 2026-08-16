@@ -2005,6 +2005,12 @@ rl.on("line", (line) => {
     let activeRequests = 0;
     let maxActiveRequests = 0;
     let failProvider = false;
+    const completePayload = {
+      unresolvedReferences: Array.from({ length: 15 }, (_, index) => ({
+        reference: `return-${index + 1}`,
+        detail: "x".repeat(1500),
+      })),
+    };
     const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
       activeRequests += 1;
       maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
@@ -2015,7 +2021,10 @@ rl.on("line", (line) => {
         body: {
           jsonrpc: "2.0",
           id: fakeRequest.body?.id,
-          result: { content: [{ type: "text", text: "async ok" }] },
+          result: {
+            content: [{ type: "text", text: "async ok" }],
+            structuredContent: completePayload,
+          },
         },
       };
     });
@@ -2089,8 +2098,23 @@ rl.on("line", (line) => {
         if (["succeeded", "failed", "timed_out"].includes(status ?? "")) break;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      expect(terminalStatus.result).toMatchObject({ status: "succeeded", terminal: true });
+      expect(terminalStatus.result).toMatchObject({
+        status: "succeeded",
+        terminal: true,
+        result: { data: { structuredContent: completePayload } },
+      });
       expect(maxActiveRequests).toBe(1);
+
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { key: "different-key", value: "different-value" },
+          async: true,
+          idempotencyKey: "long-running-1",
+        },
+      })).rejects.toMatchObject({ status: 409, reasonCode: "idempotency_key_conflict" });
 
       await gateway.executeTool({
         sessionToken: session.token,

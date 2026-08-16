@@ -68,6 +68,7 @@ describe("tool content guards", () => {
 
     expect(result.summary.summary).toContain("***REDACTED***");
     expect(result.summary.summary).not.toContain("sk-secret-value");
+    expect(result.value).toMatchObject({ query: "ok", apiKey: "***REDACTED***" });
     expect(result.findings).toContain("sensitive_value");
   });
 

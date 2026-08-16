@@ -42,6 +42,7 @@ import type {
   ToolConnectionTestCallStatus,
   ToolConnectionTestCallStatusPhase,
   ToolCredentialSecretRef,
+  ToolRedactedValueSummary,
   ToolMcpGateway,
   ToolMcpGatewayClientSnippet,
   ToolMcpGatewayToken,
@@ -55,7 +56,7 @@ import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
-import { toolAccessPolicyService } from "./tool-access-policy.js";
+import { ToolInvocationIdempotencyConflictError, toolAccessPolicyService } from "./tool-access-policy.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
   createToolRuntimeSupervisor,
@@ -89,6 +90,20 @@ const MAX_TOOL_TIMEOUT_MS = 60_000;
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
+const MAX_STORED_TOOL_RESULT_BYTES = MAX_REMOTE_MCP_RESPONSE_BYTES;
+const TERMINAL_TOOL_INVOCATION_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "timed_out",
+  "rate_limited",
+  "denied",
+  "unknown",
+]);
+const TOOL_EXECUTION_LOST_ERROR_CODE = "tool_execution_lost_on_restart";
+const TOOL_EXECUTION_LOST_ERROR_MESSAGE =
+  "Paperclip restarted before this tool call reached a durable terminal state. The provider may have applied the side effect; read its receipt or downstream state before retrying with a new idempotency key.";
+const TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION =
+  "Read the provider receipt or downstream state before retrying with a new idempotency key.";
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -465,6 +480,17 @@ function summarizeResult(result: unknown): Record<string, unknown> {
   };
 }
 
+function completeStoredToolResult(validation: ReturnType<typeof validateToolContent>): unknown {
+  if ((validation.summary.sizeBytes ?? 0) > MAX_STORED_TOOL_RESULT_BYTES) {
+    throw new ToolContentValidationError(
+      `Tool result exceeds the ${MAX_STORED_TOOL_RESULT_BYTES}-byte durable result limit`,
+      "tool_result_too_large",
+      ["result_too_large"],
+    );
+  }
+  return validation.value;
+}
+
 function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
   const lower = toolName.toLowerCase();
   if (/\b(delete|destroy|remove|drop|truncate|wipe|purge)\b|(^|[:._-])(delete|destroy|remove|drop|truncate|wipe|purge)([:._-]|$)/.test(lower)) {
@@ -807,6 +833,21 @@ export function createToolGatewayService(
   const secrets = secretService(db);
   const protocolLimits = mcpGatewayProtocolLimits(options.mcpGatewayProtocolLimits);
   let nextProtocolRateLimitPruneAt = 0;
+
+  async function recordToolInvocation(input: ToolAccessDecisionInput, accessDecision: ToolAccessDecision) {
+    try {
+      return await policyService.recordInvocation(input, accessDecision);
+    } catch (error) {
+      if (error instanceof ToolInvocationIdempotencyConflictError) {
+        throw new ToolGatewayHttpError(
+          409,
+          error.message,
+          "idempotency_key_conflict",
+        );
+      }
+      throw error;
+    }
+  }
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {
     if (current < nextProtocolRateLimitPruneAt) return;
@@ -1384,8 +1425,8 @@ export function createToolGatewayService(
     toolName: string;
     policyDecision?: "allow" | "deny" | "require_approval" | "defer_runtime" | null;
     reasonCode?: string | null;
-    argumentsSummary?: ReturnType<typeof summarizeToolValue> | null;
-    resultSummary?: ReturnType<typeof summarizeToolValue> | null;
+    argumentsSummary?: ToolRedactedValueSummary | null;
+    resultSummary?: ToolRedactedValueSummary | null;
     metadata?: Record<string, unknown> | null;
     tool?: ToolGatewayDescriptor | null;
   }) {
@@ -3852,12 +3893,14 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const resultPayload = completeStoredToolResult(resultValidation);
       await db
         .update(toolInvocations)
         .set({
           status: "succeeded",
           resultHash: resultValidation.summary.sha256 ?? null,
           resultSummary: resultValidation.summary,
+          resultPayload,
           resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
           completedAt: new Date(),
           updatedAt: new Date(),
@@ -4088,6 +4131,7 @@ export function createToolGatewayService(
   }
 
   function storedInvocationResult(invocation: typeof toolInvocations.$inferSelect): unknown {
+    if (invocation.resultPayload !== null && invocation.resultPayload !== undefined) return invocation.resultPayload;
     const summary = invocation.resultSummary?.summary;
     if (typeof summary !== "string") return null;
     try {
@@ -4278,11 +4322,13 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const resultPayload = completeStoredToolResult(resultValidation);
       const now = new Date();
       await db.update(toolInvocations).set({
         status: "succeeded",
         resultHash: resultValidation.summary.sha256 ?? null,
         resultSummary: resultValidation.summary,
+        resultPayload,
         resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
         completedAt: now,
         updatedAt: now,
@@ -4441,7 +4487,8 @@ export function createToolGatewayService(
       || invocation.status === "failed"
       || invocation.status === "timed_out"
       || invocation.status === "rate_limited"
-      || invocation.status === "denied";
+      || invocation.status === "denied"
+      || invocation.status === "unknown";
 
     let phase: ToolConnectionTestCallStatusPhase;
     if (actionRequest.status === "rejected") {
@@ -5003,7 +5050,7 @@ export function createToolGatewayService(
         consumeRateLimit: true,
       });
       const accessDecision = await policyService.decide(decisionInput);
-      const recorded = await policyService.recordInvocation(decisionInput, accessDecision);
+      const recorded = await recordToolInvocation(decisionInput, accessDecision);
       await policyService.writeAudit(decisionInput, accessDecision);
       const invocationId = recorded.invocation.id;
 
@@ -5403,13 +5450,12 @@ export function createToolGatewayService(
         }
         if (
           invocation.agentId !== session.agentId
-          || invocation.runId !== session.runId
           || invocation.issueId !== session.issueId
           || invocation.gatewayId !== (session.gatewayId ?? null)
         ) {
           throw new ToolGatewayHttpError(403, "Tool invocation is outside the authenticated run scope", "invocation_scope_mismatch");
         }
-        const terminal = ["succeeded", "failed", "timed_out", "rate_limited", "denied"].includes(invocation.status);
+        const terminal = TERMINAL_TOOL_INVOCATION_STATUSES.has(invocation.status);
         return {
           invocationId: invocation.id,
           status: "completed" as const,
@@ -5419,9 +5465,13 @@ export function createToolGatewayService(
             tool: invocation.toolName,
             status: invocation.status,
             terminal,
-            result: invocation.resultSummary ?? null,
+            result: invocation.resultPayload ?? invocation.resultSummary ?? null,
             errorCode: invocation.errorCode ?? null,
             errorMessage: invocation.errorMessage ?? null,
+            reconciliationRequired: invocation.status === "unknown",
+            nextAction: invocation.status === "unknown"
+              ? TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION
+              : null,
           },
         };
       }
@@ -5440,6 +5490,7 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         const [invocation] = await db.insert(toolInvocations).values({
           companyId: session.companyId,
           actorType: session.actorType ?? (session.agentId ? "agent" : "system"),
@@ -5459,6 +5510,7 @@ export function createToolGatewayService(
           status: "succeeded",
           resultHash: resultValidation.summary.sha256 ?? null,
           resultSummary: resultValidation.summary,
+          resultPayload,
           resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
           startedAt: new Date(),
           completedAt: new Date(),
@@ -5752,7 +5804,7 @@ export function createToolGatewayService(
           consumeRateLimit: true,
         });
         const accessDecision = await policyService.decide(decisionInput);
-        const recorded = await policyService.recordInvocation(decisionInput, accessDecision);
+        const recorded = await recordToolInvocation(decisionInput, accessDecision);
         await policyService.writeAudit(decisionInput, accessDecision);
         invocationId = recorded.invocation.id;
         if (recorded.replayed) {
@@ -5782,10 +5834,14 @@ export function createToolGatewayService(
                 invocationId,
                 tool: tool.name,
                 status: recorded.invocation.status,
-                terminal: ["succeeded", "failed", "timed_out", "rate_limited", "denied"].includes(recorded.invocation.status),
-                result: recorded.invocation.resultSummary ?? null,
+                terminal: TERMINAL_TOOL_INVOCATION_STATUSES.has(recorded.invocation.status),
+                result: recorded.invocation.resultPayload ?? recorded.invocation.resultSummary ?? null,
                 errorCode: recorded.invocation.errorCode ?? null,
                 errorMessage: recorded.invocation.errorMessage ?? null,
+                reconciliationRequired: recorded.invocation.status === "unknown",
+                nextAction: recorded.invocation.status === "unknown"
+                  ? TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION
+                  : null,
               },
             };
           }
@@ -5903,12 +5959,14 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         await db
           .update(toolInvocations)
           .set({
             status: "succeeded",
             resultHash: resultValidation.summary.sha256 ?? null,
             resultSummary: resultValidation.summary,
+            resultPayload,
             resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
             completedAt: new Date(),
             updatedAt: new Date(),
@@ -6129,7 +6187,7 @@ export function createToolGatewayService(
         consumeRateLimit: true,
       });
       const accessDecision = await policyService.decide(decisionInput);
-      const recorded = await policyService.recordInvocation(decisionInput, accessDecision);
+      const recorded = await recordToolInvocation(decisionInput, accessDecision);
       await policyService.writeAudit(decisionInput, accessDecision);
       invocationId = recorded.invocation.id;
 
@@ -6213,12 +6271,14 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         await db
           .update(toolInvocations)
           .set({
             status: "succeeded",
             resultHash: resultValidation.summary.sha256 ?? null,
             resultSummary: resultValidation.summary,
+            resultPayload,
             resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
             completedAt: new Date(),
             updatedAt: new Date(),
@@ -6309,6 +6369,82 @@ export function createToolGatewayService(
         }
         throw err;
       }
+    },
+
+    async reconcileLostToolExecutions() {
+      const now = new Date();
+      const lost = await db
+        .update(toolInvocations)
+        .set({
+          status: "unknown",
+          errorCode: TOOL_EXECUTION_LOST_ERROR_CODE,
+          errorMessage: TOOL_EXECUTION_LOST_ERROR_MESSAGE,
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(inArray(toolInvocations.status, ["authorized", "executing"]))
+        .returning();
+
+      for (const invocation of lost) {
+        const session: ToolGatewaySession = {
+          id: "restart-reconciliation",
+          token: "restart-reconciliation",
+          companyId: invocation.companyId,
+          agentId: invocation.agentId,
+          runId: invocation.runId,
+          issueId: invocation.issueId,
+          projectId: null,
+          gatewayId: invocation.gatewayId,
+          gatewayPublicId: invocation.gatewayPublicId,
+          actorType: "system",
+          actorId: invocation.companyId,
+          createdAt: now,
+          expiresAt: now,
+        };
+        const actions = await db
+          .update(toolActionRequests)
+          .set({ status: "failed", resolvedAt: now, updatedAt: now })
+          .where(and(eq(toolActionRequests.invocationId, invocation.id), eq(toolActionRequests.status, "executing")))
+          .returning({ id: toolActionRequests.id });
+        for (const action of actions) {
+          await reflectToolActionInteractionLifecycle({
+            actionRequestId: action.id,
+            status: "failed",
+            errorCode: TOOL_EXECUTION_LOST_ERROR_CODE,
+            errorMessage: invocation.errorMessage,
+          });
+        }
+        await writeToolCallEvent({
+          invocationId: invocation.id,
+          session,
+          eventType: "call_failed",
+          outcome: "failure",
+          toolName: invocation.toolName,
+          policyDecision: "defer_runtime",
+          reasonCode: TOOL_EXECUTION_LOST_ERROR_CODE,
+          argumentsSummary: invocation.argumentsSummary,
+          metadata: {
+            reconciliationRequired: true,
+            nextAction: TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION,
+          },
+        });
+        await writeAudit({
+          session,
+          companyId: invocation.companyId,
+          agentId: invocation.agentId,
+          runId: invocation.runId,
+          issueId: invocation.issueId,
+          action: "tool_gateway.call_deferred",
+          details: {
+            invocationId: invocation.id,
+            decision: "defer_runtime",
+            reasonCode: TOOL_EXECUTION_LOST_ERROR_CODE,
+            tool: invocation.toolName,
+            reconciliationRequired: true,
+          },
+        });
+      }
+      return { reconciledCount: lost.length, invocationIds: lost.map((invocation) => invocation.id) };
     },
 
     async revokeSession(input: {

@@ -1067,6 +1067,7 @@ export const TOOL_INVOCATION_STATUSES = [
   "cancelled",
   "timed_out",
   "rate_limited",
+  "unknown",
 ] as const;
 export type ToolInvocationStatus = (typeof TOOL_INVOCATION_STATUSES)[number];
 

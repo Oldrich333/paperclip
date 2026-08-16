@@ -207,6 +207,14 @@ export function summarizeToolValue(value: unknown) {
   };
 }
 
+function redactToolValue(value: unknown): unknown {
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (Array.isArray(value)) return value.map(redactToolValue);
+  if (!isPlainObject(value)) return value;
+  const eventRedacted = redactEventPayload(value) ?? {};
+  return Object.fromEntries(Object.entries(eventRedacted).map(([key, nested]) => [key, redactToolValue(nested)]));
+}
+
 export function validateToolContent(input: {
   value: unknown;
   direction: "arguments" | "result";
@@ -215,7 +223,7 @@ export function validateToolContent(input: {
 }) {
   const sensitiveMode = input.sensitiveMode ?? "redact";
   const promptInjectionMode = input.promptInjectionMode ?? (input.direction === "result" ? "block" : "ignore");
-  const redactedValue = isPlainObject(input.value) ? redactEventPayload(input.value) : input.value;
+  const redactedValue = redactToolValue(input.value);
   const redactedSummary = summarizeToolValue(redactedValue);
   const findings: string[] = [];
 

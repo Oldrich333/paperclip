@@ -71,6 +71,28 @@ type ToolAccessContext = {
   arguments: unknown;
 };
 
+export class ToolInvocationIdempotencyConflictError extends Error {
+  constructor() {
+    super("The idempotency key is already bound to a different tool call scope or payload");
+    this.name = "ToolInvocationIdempotencyConflictError";
+  }
+}
+
+function invocationMatchesIdempotency(
+  invocation: typeof toolInvocations.$inferSelect,
+  ctx: ToolAccessContext,
+  argumentsHash: string,
+) {
+  return invocation.toolName === ctx.toolName
+    && invocation.argumentsHash === argumentsHash
+    && invocation.agentId === ctx.agentId
+    && invocation.issueId === ctx.issueId
+    && invocation.gatewayId === ctx.gatewayId
+    && invocation.applicationId === ctx.applicationId
+    && invocation.connectionId === ctx.connectionId
+    && invocation.catalogEntryId === ctx.catalogEntryId;
+}
+
 type RedactionResult = {
   summary: ToolRedactedValueSummary;
   redactionPlan: { redactedFieldCount: number; redactedFields: string[] };
@@ -1387,7 +1409,10 @@ export function toolAccessPolicyService(db: Db) {
         eq(toolInvocations.companyId, input.companyId),
         eq(toolInvocations.idempotencyKey, idempotencyKey),
       ));
-      if (existing) return { invocation: existing, replayed: true, actionRequest: null };
+      if (existing) {
+        if (!invocationMatchesIdempotency(existing, ctx, argumentsHash)) throw new ToolInvocationIdempotencyConflictError();
+        return { invocation: existing, replayed: true, actionRequest: null };
+      }
     }
     const status = accessDecision.decision === "allow"
       ? ("authorized" as const)
@@ -1436,7 +1461,10 @@ export function toolAccessPolicyService(db: Db) {
         eq(toolInvocations.companyId, input.companyId),
         eq(toolInvocations.idempotencyKey, idempotencyKey),
       ));
-      if (invocation) return { invocation, replayed: true, actionRequest: null };
+      if (invocation) {
+        if (!invocationMatchesIdempotency(invocation, ctx, argumentsHash)) throw new ToolInvocationIdempotencyConflictError();
+        return { invocation, replayed: true, actionRequest: null };
+      }
     }
     if (!invocation) throw new Error("Tool invocation was not recorded");
     let actionRequest = null;

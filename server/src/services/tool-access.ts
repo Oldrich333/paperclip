@@ -819,6 +819,7 @@ function toToolInvocation(row: typeof toolInvocations.$inferSelect): ToolInvocat
     upstreamRequestId: row.upstreamRequestId,
     resultHash: row.resultHash,
     resultSummary: row.resultSummary ?? null,
+    resultPayload: row.resultPayload ?? null,
     resultSizeBytes: row.resultSizeBytes,
     resultArtifactId: row.resultArtifactId,
     errorCode: row.errorCode,
@@ -949,6 +950,7 @@ function denialReasonForDecision(
     || invocation.status === "rate_limited"
     || invocation.status === "failed"
     || invocation.status === "timed_out"
+    || invocation.status === "unknown"
   ) {
     return invocation.errorMessage ?? invocation.errorCode ?? latestAuditEvent?.reasonCode ?? null;
   }

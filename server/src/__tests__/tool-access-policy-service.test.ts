@@ -28,7 +28,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { toolAccessPolicyService } from "../services/tool-access-policy.js";
+import {
+  ToolInvocationIdempotencyConflictError,
+  toolAccessPolicyService,
+} from "../services/tool-access-policy.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 
@@ -883,6 +886,55 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(first.invocation.idempotencyKey).toMatch(/^side_effect:/);
     expect(replay.replayed).toBe(true);
     expect(replay.invocation.id).toBe(first.invocation.id);
+  });
+
+  it("rejects idempotency reuse across payload or continuation scope", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const otherAgent = await createAgent(db, company.id);
+    const issue = await createIssue(db, company.id, "Original idempotent call");
+    const otherIssue = await createIssue(db, company.id, "Other idempotent call");
+    const { connection } = await createTool(db, company.id);
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent.id,
+      permissionKey: "tools:use",
+      scope: { toolName: "send_email" },
+    });
+    const gatewayId = null;
+    const base = {
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+      runContext: { issueId: issue.id, gatewayId },
+      request: {
+        connectionId: connection.id,
+        toolName: "send_email",
+        arguments: { to: "ops@example.com", body: "once" },
+        idempotencyKey: "scoped-idempotency-1",
+      },
+    };
+    const service = toolAccessPolicyService(db);
+    const decision = await service.decide(base);
+    await service.recordInvocation(base, decision);
+
+    const conflicts = [
+      { ...base, request: { ...base.request, arguments: { to: "ops@example.com", body: "changed" } } },
+      { ...base, actor: { actorType: "agent" as const, actorId: otherAgent.id, agentId: otherAgent.id } },
+      { ...base, runContext: { issueId: otherIssue.id, gatewayId } },
+      { ...base, runContext: { issueId: issue.id, gatewayId: randomUUID() } },
+    ];
+    for (const conflictInput of conflicts) {
+      await expect(service.recordInvocation(conflictInput, decision))
+        .rejects.toBeInstanceOf(ToolInvocationIdempotencyConflictError);
+    }
+
+    const continuationRun = await createRun(db, company.id, agent.id, { issueId: issue.id });
+    const replay = await service.recordInvocation({
+      ...base,
+      runContext: { issueId: issue.id, gatewayId, heartbeatRunId: continuationRun.id },
+    }, decision);
+    expect(replay.replayed).toBe(true);
   });
 
   it("enforces rate-limit policies before explicit grants", async () => {

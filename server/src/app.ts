@@ -299,6 +299,7 @@ export async function createApp(
     deploymentExposure: opts.deploymentExposure,
     trustedLocalStdioRuntimeHost,
   });
+  await toolGateway.reconcileLostToolExecutions();
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.

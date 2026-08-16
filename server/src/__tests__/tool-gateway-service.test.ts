@@ -172,6 +172,49 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await tempDb?.cleanup();
   });
 
+  it("reconciles in-flight tool calls after a restart without releasing their retry key", async () => {
+    const { company, agent, issue, run } = await createRunFixture(db);
+    const [invocation] = await db.insert(toolInvocations).values({
+      companyId: company.id,
+      idempotencyKey: "restart-reconciliation-1",
+      actorType: "agent",
+      actorId: agent.id,
+      agentId: agent.id,
+      issueId: issue.id,
+      runId: run.id,
+      toolName: "returns:append_row",
+      argumentsHash: "restart-arguments",
+      status: "executing",
+      startedAt: new Date(Date.now() - 1_000),
+    }).returning();
+    const gateway = createTestToolGatewayService(db);
+
+    await expect(gateway.reconcileLostToolExecutions()).resolves.toMatchObject({
+      reconciledCount: 1,
+      invocationIds: [invocation!.id],
+    });
+
+    const [stored] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, invocation!.id));
+    expect(stored).toMatchObject({
+      status: "unknown",
+      errorCode: "tool_execution_lost_on_restart",
+      idempotencyKey: "restart-reconciliation-1",
+    });
+
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const status = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "get_tool_run",
+      parameters: { invocationId: invocation!.id },
+    });
+    expect(status.result).toMatchObject({
+      status: "unknown",
+      terminal: true,
+      reconciliationRequired: true,
+      nextAction: expect.stringContaining("provider receipt"),
+    });
+  });
+
   it("gates write tools with an action request and executes only stored reviewed arguments once", async () => {
     const { company, agent, run } = await createRunFixture(db);
     await db.insert(toolPolicies).values({
