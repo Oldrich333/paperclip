@@ -395,6 +395,7 @@ export const createToolProfileBindingSchema = z.object({
   profileId: z.string().uuid(),
   targetType: toolProfileBindingTargetTypeSchema,
   targetId: z.string().trim().min(1).max(200),
+  bindingMode: z.enum(["override", "baseline"]).optional(),
   priority: z.number().int().min(0).max(10000).default(100),
   metadata: z.record(z.string(), z.unknown()).optional().nullable(),
 });

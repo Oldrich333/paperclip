@@ -42,7 +42,7 @@ import type {
 } from "@paperclipai/shared";
 import { toolPolicyConditionsSchema } from "@paperclipai/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../errors.js";
-import { narrowestScopeBindings, profileIdsInBindingOrder } from "./tool-profile-binding-precedence.js";
+import { effectiveScopeBindings, profileIdsInBindingOrder } from "./tool-profile-binding-precedence.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
 
 type ToolAccessContext = {
@@ -1002,7 +1002,7 @@ export function toolAccessPolicyService(db: Db) {
 
   async function effectiveProfiles(ctx: ToolAccessContext) {
     const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, ctx.companyId));
-    const activeBindings = narrowestScopeBindings(bindings.filter((binding) => targetMatches(binding, ctx)));
+    const activeBindings = effectiveScopeBindings(bindings.filter((binding) => targetMatches(binding, ctx)));
     if (activeBindings.length === 0) return { profiles: [], entries: [] as Array<typeof toolProfileEntries.$inferSelect> };
     const profileIds = profileIdsInBindingOrder(activeBindings);
     const profiles = await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, ctx.companyId), inArray(toolProfiles.id, profileIds)));

@@ -5,6 +5,7 @@ type BindingLike = {
   targetType: ToolProfileBindingTargetType;
   priority: number;
   createdAt: Date | string;
+  metadata?: unknown;
 };
 
 const TOOL_PROFILE_SCOPE_PRECEDENCE: Record<ToolProfileBindingTargetType, number> = {
@@ -36,6 +37,37 @@ export function narrowestScopeBindings<T extends BindingLike>(bindings: T[]): T[
       || createdAtMillis(a.createdAt) - createdAtMillis(b.createdAt)
       || a.profileId.localeCompare(b.profileId)
     );
+}
+
+function isRequiredCompanyBaseline(binding: BindingLike): boolean {
+  if (binding.targetType !== "company" || typeof binding.metadata !== "object" || binding.metadata === null) {
+    return false;
+  }
+  return (binding.metadata as Record<string, unknown>).bindingMode === "baseline";
+}
+
+/**
+ * Compose explicitly marked company foundations with the narrowest normal working-set scope.
+ * Do not use this helper for connection-token mint authority, where strict narrowest-scope
+ * replacement remains a privilege boundary.
+ */
+export function effectiveScopeBindings<T extends BindingLike>(bindings: T[]): T[] {
+  const contextual = narrowestScopeBindings(bindings);
+  // A named gateway is an explicit external capability boundary. It receives
+  // only profiles bound to that gateway; founder/operator gateways that need
+  // company memory must bind the memory profile explicitly.
+  if (contextual.length === 0 || contextual[0]?.targetType === "company" || contextual[0]?.targetType === "gateway") {
+    return contextual;
+  }
+  const seen = new Set(contextual.map((binding) => binding.profileId));
+  const baselines = bindings
+    .filter((binding) => isRequiredCompanyBaseline(binding) && !seen.has(binding.profileId))
+    .sort((a, b) =>
+      a.priority - b.priority
+      || createdAtMillis(a.createdAt) - createdAtMillis(b.createdAt)
+      || a.profileId.localeCompare(b.profileId)
+    );
+  return [...contextual, ...baselines];
 }
 
 export function profileIdsInBindingOrder<T extends Pick<BindingLike, "profileId">>(bindings: T[]): string[] {

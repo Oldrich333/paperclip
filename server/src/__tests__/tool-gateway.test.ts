@@ -525,13 +525,18 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
 
   it("exposes a named gateway with scoped bearer-token auth and revocation", async () => {
     const company = await createCompany(db);
-    const remote = await startFakeRemoteMcpServer(async () => ({
-      body: {
-        jsonrpc: "2.0",
-        id: "test",
-        result: { content: [{ type: "text", text: "read ok" }], structuredContent: { ok: true } },
-      },
-    }));
+    const remote = await startFakeRemoteMcpServer(async (request) => {
+      const forceError = JSON.stringify(request.body).includes('"forceError":true');
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: "test",
+          result: forceError
+            ? { content: [{ type: "text", text: "write_conflict" }], isError: true }
+            : { content: [{ type: "text", text: "read ok" }], structuredContent: { ok: true } },
+        },
+      };
+    });
     try {
       const { application, connection, catalogEntry } = await createRemoteMcpTool(db, company.id, {
         url: remote.url,
@@ -549,6 +554,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         companyId: company.id,
         profileKey: `named-gateway-${randomUUID()}`,
         name: `Named gateway ${randomUUID()}`,
+        status: "active",
         defaultAction: "deny",
       }).returning();
       await db.insert(toolProfileEntries).values({
@@ -556,7 +562,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         profileId: profile.id,
         selectorType: "tool_name",
         effect: "include",
-        toolName: gatewayToolName,
+        toolName: catalogEntry.toolName,
       });
 
       const gateway = createTestToolGatewayService(db);
@@ -598,6 +604,21 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         })
         .expect(200);
       expect(called.body.result.content).toEqual([{ type: "text", text: "read ok" }]);
+      expect(called.body.result.isError).toBe(false);
+      const rejectedResult = await request(app)
+        .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+        .set("authorization", `Bearer ${token.token}`)
+        .send({
+          jsonrpc: "2.0",
+          id: 22,
+          method: "tools/call",
+          params: { name: gatewayToolName, arguments: { forceError: true } },
+        })
+        .expect(200);
+      expect(rejectedResult.body.result).toMatchObject({
+        content: [{ type: "text", text: "write_conflict" }],
+        isError: true,
+      });
       const upstreamRequestCountAfterAllowedCall = remote.requests.length;
 
       const denied = await request(app)

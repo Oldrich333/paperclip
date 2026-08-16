@@ -132,13 +132,22 @@ async function handleMcpGatewayProtocol(
       const contentText = typeof resultRecord?.content === "string"
         ? resultRecord.content
         : JSON.stringify(resultRecord?.data ?? result.result ?? null);
+      const resultData = resultRecord?.data && typeof resultRecord.data === "object" && !Array.isArray(resultRecord.data)
+        ? resultRecord.data as Record<string, unknown>
+        : null;
+      // A remote MCP server reports domain failures (for example an
+      // optimistic-concurrency conflict) as a successful JSON-RPC response
+      // whose tool result has isError=true. Preserve that bit at the outer
+      // named-gateway boundary; otherwise clients can mistake a rejected write
+      // for success even though the provider and invocation correctly failed.
+      const isError = resultRecord?.error !== undefined || resultData?.isError === true;
       res.json({
         jsonrpc: "2.0",
         id,
         result: {
           content: [{ type: "text", text: contentText }],
           structuredContent: resultRecord?.data ?? null,
-          isError: false,
+          isError,
         },
       });
       return;

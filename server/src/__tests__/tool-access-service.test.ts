@@ -1838,6 +1838,7 @@ describeEmbeddedPostgres("tool access service", () => {
       transport: "mcp_remote",
       status: "active",
       enabled: true,
+      healthStatus: "ok",
       config: { url: "https://fixture.example/mcp" },
     }).returning();
     const [readEntry, writeEntry] = await db.insert(toolCatalogEntries).values([
@@ -1973,6 +1974,121 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(effective.bindings.map((binding) => `${binding.targetType}:${binding.targetId}`)).toEqual([`agent:${agent!.id}`]);
     expect(effective.allowedTools).toEqual([]);
     expect(effective.allowedToolNames).toEqual([]);
+  });
+
+  it("composes a validated company baseline with a narrower agent working set", async () => {
+    const company = await createCompany(db);
+    const [agent] = await db.insert(agents).values({
+      companyId: company.id,
+      name: `Baseline Preview Agent ${randomUUID()}`,
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `baseline-app-${randomUUID()}`,
+      name: "Baseline app",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: "Baseline connection",
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      healthStatus: "ok",
+      config: { url: "https://fixture.example/mcp" },
+    }).returning();
+    const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      connectionId: connection!.id,
+      name: "company_memory_read",
+      toolName: "company_memory_read",
+      riskLevel: "read",
+      status: "active",
+      versionHash: randomUUID(),
+      schemaHash: randomUUID(),
+    }).returning();
+
+    const service = toolAccessService(db);
+    const [baselineProfile, agentProfile, unsafeProfile] = await Promise.all([
+      service.createProfile(company.id, {
+        profileKey: `baseline-${randomUUID()}`,
+        name: "Required company memory",
+        defaultAction: "deny",
+        entries: [{
+          selectorType: "catalog_entry",
+          effect: "include",
+          catalogEntryId: catalogEntry!.id,
+          connectionId: connection!.id,
+        }],
+      }),
+      service.createProfile(company.id, {
+        profileKey: `agent-${randomUUID()}`,
+        name: "Agent working set",
+        defaultAction: "deny",
+      }),
+      service.createProfile(company.id, {
+        profileKey: `unsafe-${randomUUID()}`,
+        name: "Unsafe allow-all baseline",
+        defaultAction: "allow",
+        entries: [{
+          selectorType: "catalog_entry",
+          effect: "include",
+          catalogEntryId: catalogEntry!.id,
+          connectionId: connection!.id,
+        }],
+      }),
+    ]);
+    await service.bindProfile(baselineProfile.id, {
+      targetType: "company",
+      targetId: company.id,
+      bindingMode: "baseline",
+      priority: 100,
+    }, { actorType: "user", actorId: "board" });
+    await service.bindProfile(agentProfile.id, {
+      targetType: "agent",
+      targetId: agent!.id,
+      priority: 10,
+    }, { actorType: "user", actorId: "board" });
+
+    const effective = await service.getEffectiveProfilesForAgent(company.id, agent!.id);
+    expect(effective.profiles.map((profile) => profile.id)).toEqual([
+      agentProfile.id,
+      baselineProfile.id,
+    ]);
+    expect(effective.allowedToolNames).toEqual(["company_memory_read"]);
+    await expect(service.updateProfile(baselineProfile.id, {
+      name: "Silently changed baseline",
+    })).rejects.toThrow("Unbind the baseline profile before modifying or deleting it");
+    await expect(service.updateConnection(connection!.id, {
+      enabled: false,
+    })).rejects.toThrow("Unbind the baseline profile before disabling or archiving its connection");
+    await expect(service.updateApplication(application!.id, {
+      status: "archived",
+    })).rejects.toThrow("Unbind the baseline profile before disabling or archiving its connection");
+    await db.update(toolApplications).set({ status: "disabled" }).where(eq(toolApplications.id, application!.id));
+    const disabledPreview = await service.getEffectiveProfilesForAgent(company.id, agent!.id);
+    expect(disabledPreview.allowedToolNames).toEqual([]);
+    await db.update(toolApplications).set({ status: "active" }).where(eq(toolApplications.id, application!.id));
+    await expect(service.bindProfile(unsafeProfile.id, {
+      targetType: "company",
+      targetId: company.id,
+      bindingMode: "baseline",
+      priority: 100,
+    }, { actorType: "user", actorId: "board" })).rejects.toThrow("deny-by-default");
+    await expect(service.bindProfile(baselineProfile.id, {
+      targetType: "agent",
+      targetId: agent!.id,
+      bindingMode: "baseline",
+      priority: 100,
+    }, { actorType: "user", actorId: "board" })).rejects.toThrow("only to their own company");
   });
 
   it("prefers agent-scoped allows over broader company defaults in previews", async () => {
@@ -3545,7 +3661,7 @@ describeEmbeddedPostgres("tool access service", () => {
       status: "active",
       versionHash: "v1",
       schemaHash: "s1",
-    });
+    }).returning();
     const [invocation] = await db.insert(toolInvocations).values({
       companyId: company.id,
       applicationId: application.id,
@@ -4591,6 +4707,50 @@ describeEmbeddedPostgres("tool access service", () => {
         selectors: { catalogEntryId: updateEntry.id },
       }),
     ]);
+    const allAgentsFinish = await service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, updateEntry.id],
+      askFirstCatalogEntryIds: [updateEntry.id],
+      access: "all_agents",
+    }, { actorType: "user", actorId: "board" });
+    await service.unbindProfile(allAgentsFinish.profile.id, { targetType: "company", targetId: company.id });
+    await service.bindProfile(allAgentsFinish.profile.id, {
+      targetType: "company",
+      targetId: company.id,
+      bindingMode: "baseline",
+    }, { actorType: "user", actorId: "board" });
+    const repeatedBaselineFinish = await service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, updateEntry.id],
+      askFirstCatalogEntryIds: [updateEntry.id],
+      access: "all_agents",
+    }, { actorType: "user", actorId: "board" });
+    expect(repeatedBaselineFinish.profileBindings).toEqual([
+      expect.objectContaining({
+        targetType: "company",
+        targetId: company.id,
+        metadata: expect.objectContaining({ bindingMode: "baseline" }),
+      }),
+    ]);
+    await expect(service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, updateEntry.id],
+      askFirstCatalogEntryIds: [updateEntry.id],
+      access: { agentIds: [agent.id] },
+    }, { actorType: "user", actorId: "board" })).rejects.toThrow(
+      "Unbind the baseline profile before changing its access scope",
+    );
+    await expect(service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, updateEntry.id],
+      askFirstCatalogEntryIds: [],
+      access: "all_agents",
+    }, { actorType: "user", actorId: "board" })).rejects.toThrow(
+      "Unbind the baseline profile before changing its approval policy",
+    );
+    await expect(service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id],
+      askFirstCatalogEntryIds: [],
+      access: "all_agents",
+    }, { actorType: "user", actorId: "board" })).rejects.toThrow(
+      "Unbind the baseline profile before changing its tool selection",
+    );
     await expect(db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, finish.profile.id))).resolves.toHaveLength(1);
     await expect(db.select().from(toolPolicies).where(eq(toolPolicies.companyId, company.id))).resolves.toHaveLength(1);
 

@@ -115,7 +115,7 @@ import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remot
 import { secretService } from "./secrets.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { readSignedToolArgumentsPayload } from "./tool-content-guards.js";
-import { narrowestScopeBindings, profileIdsInBindingOrder } from "./tool-profile-binding-precedence.js";
+import { effectiveScopeBindings, narrowestScopeBindings, profileIdsInBindingOrder } from "./tool-profile-binding-precedence.js";
 import { recordToolRuntimeAuditWriteFailure, TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC } from "./tool-runtime-metrics.js";
 import { createToolRuntimeSupervisor, ToolRuntimeSupervisorError } from "./tool-runtime-supervisor.js";
 
@@ -2323,6 +2323,99 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
   }
 
+  async function assertRequiredBaselineProfile(
+    profile: typeof toolProfiles.$inferSelect,
+    input: CreateToolProfileBindingForProfile,
+  ) {
+    if (input.bindingMode !== "baseline") return;
+    if (input.targetType !== "company" || input.targetId !== profile.companyId) {
+      throw unprocessable("Baseline tool profiles may bind only to their own company");
+    }
+    if (profile.status !== "active") {
+      throw unprocessable("Baseline tool profiles must be active");
+    }
+    if (profile.defaultAction !== "deny") {
+      throw unprocessable("Baseline tool profiles must be deny-by-default");
+    }
+    const entries = await db
+      .select({
+        selectorType: toolProfileEntries.selectorType,
+        effect: toolProfileEntries.effect,
+        connectionId: toolProfileEntries.connectionId,
+        toolName: toolProfileEntries.toolName,
+      })
+      .from(toolProfileEntries)
+      .where(and(
+        eq(toolProfileEntries.companyId, profile.companyId),
+        eq(toolProfileEntries.profileId, profile.id),
+      ));
+    const connectionIds = new Set(entries.map((entry) => entry.connectionId).filter(Boolean));
+    if (
+      entries.length === 0
+      || entries.some((entry) => (
+        entry.selectorType !== "catalog_entry" || entry.effect !== "include" || !entry.connectionId
+      ))
+      || connectionIds.size !== 1
+      || entries.some((entry) => entry.toolName === CONNECTION_TOKEN_MINT_TOOL_NAME)
+    ) {
+      throw unprocessable(
+        "Baseline tool profiles must use explicit include-only catalog entries from one concrete connection",
+      );
+    }
+  }
+
+  async function assertBaselineProfileDetached(profileId: string) {
+    const bindings = await db
+      .select({ metadata: toolProfileBindings.metadata })
+      .from(toolProfileBindings)
+      .where(eq(toolProfileBindings.profileId, profileId));
+    if (bindings.some((binding) => asRecord(binding.metadata).bindingMode === "baseline")) {
+      throw conflict("Unbind the baseline profile before modifying or deleting it");
+    }
+  }
+
+  async function assertConnectionNotRequiredByBaseline(
+    companyId: string,
+    connectionId: string,
+  ) {
+    const bindings = await db
+      .select({ profileId: toolProfileBindings.profileId, metadata: toolProfileBindings.metadata })
+      .from(toolProfileBindings)
+      .where(eq(toolProfileBindings.companyId, companyId));
+    const baselineProfileIds = bindings
+      .filter((binding) => asRecord(binding.metadata).bindingMode === "baseline")
+      .map((binding) => binding.profileId);
+    if (baselineProfileIds.length === 0) return;
+    const [entry] = await db
+      .select({ id: toolProfileEntries.id })
+      .from(toolProfileEntries)
+      .where(and(
+        eq(toolProfileEntries.companyId, companyId),
+        eq(toolProfileEntries.connectionId, connectionId),
+        inArray(toolProfileEntries.profileId, baselineProfileIds),
+      ))
+      .limit(1);
+    if (entry) {
+      throw conflict("Unbind the baseline profile before disabling or archiving its connection");
+    }
+  }
+
+  async function assertApplicationNotRequiredByBaseline(
+    companyId: string,
+    applicationId: string,
+  ) {
+    const connectionRows = await db
+      .select({ id: toolConnections.id })
+      .from(toolConnections)
+      .where(and(
+        eq(toolConnections.companyId, companyId),
+        eq(toolConnections.applicationId, applicationId),
+      ));
+    for (const connection of connectionRows) {
+      await assertConnectionNotRequiredByBaseline(companyId, connection.id);
+    }
+  }
+
   async function appProfileForConnection(
     dbClient: Pick<Db, "select" | "insert">,
     connection: typeof toolConnections.$inferSelect,
@@ -2555,6 +2648,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     actor?: ActorInfo,
   ): Promise<ToolProfileNewToolsReviewResult> {
     const profile = await getProfileRow(profileId);
+    await assertBaselineProfileDetached(profile.id);
     const review = await listProfileNewTools(profile.id, profile.companyId);
     if (review.tools.length === 0) throw badRequest("No new tools are pending review for this profile");
 
@@ -4507,7 +4601,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       applicationId: connection.applicationId,
     }));
     const profileKey = `app:${connection.id}`;
-    const bindingInputs: CreateToolProfileBindingForProfile[] = input.access === "all_agents"
+    let bindingInputs: CreateToolProfileBindingForProfile[] = input.access === "all_agents"
       ? [{ targetType: "company", targetId: companyId, priority: 100, metadata: { source: "app_gallery_finish" } }]
       : [...new Set(input.access.agentIds)].map((agentId) => ({
           targetType: "agent" as const,
@@ -4523,6 +4617,71 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         .limit(1);
       let profileId: string;
       if (existingProfile) {
+        const [existingBindings, existingEntries, existingPolicies] = await Promise.all([
+          tx
+            .select({ targetType: toolProfileBindings.targetType, metadata: toolProfileBindings.metadata })
+            .from(toolProfileBindings)
+            .where(and(
+              eq(toolProfileBindings.companyId, companyId),
+              eq(toolProfileBindings.profileId, existingProfile.id),
+            )),
+          tx
+            .select({ catalogEntryId: toolProfileEntries.catalogEntryId })
+            .from(toolProfileEntries)
+            .where(and(
+              eq(toolProfileEntries.companyId, companyId),
+              eq(toolProfileEntries.profileId, existingProfile.id),
+            )),
+          tx
+            .select({ enabled: toolPolicies.enabled, policyType: toolPolicies.policyType, config: toolPolicies.config })
+            .from(toolPolicies)
+            .where(eq(toolPolicies.companyId, companyId)),
+        ]);
+        const hasCompanyBaseline = existingBindings.some((binding) => (
+          binding.targetType === "company" && asRecord(binding.metadata).bindingMode === "baseline"
+        ));
+        if (hasCompanyBaseline) {
+          if (input.access !== "all_agents") {
+            throw conflict("Unbind the baseline profile before changing its access scope");
+          }
+          const previousCatalogIds = existingEntries
+            .map((entry) => entry.catalogEntryId)
+            .filter((entryId): entryId is string => Boolean(entryId))
+            .sort();
+          const nextCatalogIds = entries
+            .map((entry) => entry.catalogEntryId)
+            .filter((entryId): entryId is string => Boolean(entryId))
+            .sort();
+          if (
+            previousCatalogIds.length !== existingEntries.length
+            || previousCatalogIds.length !== nextCatalogIds.length
+            || previousCatalogIds.some((entryId, index) => entryId !== nextCatalogIds[index])
+          ) {
+            throw conflict("Unbind the baseline profile before changing its tool selection");
+          }
+          const previousAskFirstIds = existingPolicies
+            .filter((policy) => {
+              const config = asRecord(policy.config);
+              return policy.enabled
+                && policy.policyType === "require_approval"
+                && config.source === "app_gallery_finish"
+                && config.connectionId === connection.id
+                && typeof config.catalogEntryId === "string";
+            })
+            .map((policy) => String(asRecord(policy.config).catalogEntryId))
+            .sort();
+          const nextAskFirstIds = [...new Set(input.askFirstCatalogEntryIds)].sort();
+          if (
+            previousAskFirstIds.length !== nextAskFirstIds.length
+            || previousAskFirstIds.some((entryId, index) => entryId !== nextAskFirstIds[index])
+          ) {
+            throw conflict("Unbind the baseline profile before changing its approval policy");
+          }
+          bindingInputs = bindingInputs.map((binding) => ({
+            ...binding,
+            metadata: { ...(binding.metadata ?? {}), bindingMode: "baseline" },
+          }));
+        }
         await tx
           .delete(toolProfileBindings)
           .where(and(eq(toolProfileBindings.companyId, companyId), eq(toolProfileBindings.profileId, existingProfile.id)));
@@ -5448,6 +5607,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     updateApplication: async (applicationId: string, input: UpdateToolApplication): Promise<ToolApplication> => {
       const [existing] = await db.select().from(toolApplications).where(eq(toolApplications.id, applicationId));
       if (!existing) throw notFound("Tool application not found");
+      if (input.status !== undefined && input.status !== "active") {
+        await assertApplicationNotRequiredByBaseline(existing.companyId, existing.id);
+      }
       await assertOptionalPlugin(input.pluginId);
       await assertOptionalAgent(existing.companyId, input.ownerAgentId, "Tool application owner agent");
       if (input.name && input.name !== existing.name) {
@@ -5804,6 +5966,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     updateConnection: async (connectionId: string, input: UpdateToolConnection): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId);
+      if (input.enabled === false || (input.status !== undefined && input.status !== "active")) {
+        await assertConnectionNotRequiredByBaseline(existing.companyId, existing.id);
+      }
       const config = normalizeGoogleSheetsConnectionConfig(input.config ?? input.transportConfig ?? existing.config);
       if (existing.transport === "mcp_remote") await assertRemoteEndpointAllowed(config);
       if (existing.transport === "local_stdio") await stdioTemplateId(existing.companyId, config);
@@ -5830,6 +5995,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     },
 
     archiveConnection: async (connectionId: string): Promise<ToolConnection> => {
+      const existing = await getConnectionRow(connectionId);
+      await assertConnectionNotRequiredByBaseline(existing.companyId, existing.id);
       const row = await db.transaction(async (tx) => {
         const [updatedConnection] = await tx
           .update(toolConnections)
@@ -6162,6 +6329,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     updateProfile: async (profileId: string, input: UpdateToolProfileWithEntries): Promise<ToolProfileWithDetails> => {
       const existing = await getProfileRow(profileId);
+      await assertBaselineProfileDetached(existing.id);
       if (input.entries) {
         for (const entry of input.entries) {
           await assertProfileEntryInput(existing.companyId, entry);
@@ -6187,6 +6355,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     duplicateProfile: async (profileId: string, input: DuplicateToolProfile): Promise<ToolProfileWithDetails> => {
       const existing = await getProfileRow(profileId);
+      if (input.includeAssignments) await assertBaselineProfileDetached(existing.id);
       const [entries, bindings] = await Promise.all([
         db
           .select()
@@ -6248,6 +6417,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       reassignedBindingCount: number;
     }> => {
       const existing = await getProfileRow(profileId);
+      await assertBaselineProfileDetached(existing.id);
       if (input.force && input.reassignToProfileId) {
         throw badRequest("Use either force or reassignToProfileId when deleting a tool profile, not both");
       }
@@ -6307,6 +6477,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       input: CreateToolProfileEntryForProfile,
     ): Promise<ToolProfileEntry> => {
       const profile = await getProfileRow(profileId);
+      await assertBaselineProfileDetached(profile.id);
       await assertProfileEntryInput(profile.companyId, input);
       const [row] = await db.insert(toolProfileEntries).values({
         companyId: profile.companyId,
@@ -6333,6 +6504,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     updateProfileEntry: async (entryId: string, input: UpdateToolProfileEntry): Promise<ToolProfileEntry> => {
       const [existing] = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.id, entryId));
       if (!existing) throw notFound("Tool profile entry not found");
+      await assertBaselineProfileDetached(existing.profileId);
       const next: CreateToolProfileEntryForProfile = {
         selectorType: input.selectorType ?? existing.selectorType,
         effect: input.effect ?? existing.effect,
@@ -6364,6 +6536,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     },
 
     deleteProfileEntry: async (entryId: string): Promise<ToolProfileEntry> => {
+      const [existing] = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.id, entryId));
+      if (!existing) throw notFound("Tool profile entry not found");
+      await assertBaselineProfileDetached(existing.profileId);
       const [row] = await db.delete(toolProfileEntries).where(eq(toolProfileEntries.id, entryId)).returning();
       if (!row) throw notFound("Tool profile entry not found");
       await db.update(toolProfiles).set({ updatedAt: new Date() }).where(eq(toolProfiles.id, row.profileId));
@@ -6377,13 +6552,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     ): Promise<ToolProfileBinding> => {
       const profile = await getProfileRow(profileId);
       await assertTargetExists(profile.companyId, input.targetType, input.targetId);
+      await assertRequiredBaselineProfile(profile, input);
       const [row] = await db.insert(toolProfileBindings).values({
         companyId: profile.companyId,
         profileId: profile.id,
         targetType: input.targetType,
         targetId: input.targetId,
         priority: input.priority ?? 100,
-        metadata: input.metadata ?? {},
+        metadata: { ...(input.metadata ?? {}), bindingMode: input.bindingMode ?? "override" },
         createdByAgentId: actor?.actorType === "agent" ? actor.actorId ?? null : null,
         createdByUserId: actor?.actorType === "user" ? actor.actorId ?? null : null,
       }).returning();
@@ -6416,7 +6592,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         .from(toolProfileBindings)
         .where(eq(toolProfileBindings.companyId, companyId))
         .orderBy(asc(toolProfileBindings.priority), asc(toolProfileBindings.createdAt));
-      const bindings = narrowestScopeBindings(allBindings.filter((binding) =>
+      const bindings = effectiveScopeBindings(allBindings.filter((binding) =>
         (binding.targetType === "company" && binding.targetId === companyId)
         || (binding.targetType === "agent" && binding.targetId === agentId)
       ));
@@ -6459,10 +6635,22 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           .where(and(eq(toolProfileEntries.companyId, companyId), inArray(toolProfileEntries.profileId, activeProfileIds)))
           .orderBy(asc(toolProfileEntries.createdAt)),
         db
-          .select()
+          .select({ catalogEntry: toolCatalogEntries })
           .from(toolCatalogEntries)
-          .where(and(eq(toolCatalogEntries.companyId, companyId), eq(toolCatalogEntries.status, "active")))
-          .orderBy(asc(toolCatalogEntries.toolName)),
+          .innerJoin(toolConnections, eq(toolCatalogEntries.connectionId, toolConnections.id))
+          .innerJoin(toolApplications, eq(toolConnections.applicationId, toolApplications.id))
+          .where(and(
+            eq(toolCatalogEntries.companyId, companyId),
+            eq(toolCatalogEntries.status, "active"),
+            eq(toolConnections.companyId, companyId),
+            eq(toolConnections.status, "active"),
+            eq(toolConnections.enabled, true),
+            inArray(toolConnections.healthStatus, ["ok", "healthy"]),
+            eq(toolApplications.companyId, companyId),
+            eq(toolApplications.status, "active"),
+          ))
+          .orderBy(asc(toolCatalogEntries.toolName))
+          .then((rows) => rows.map((row) => row.catalogEntry)),
         db
           .select({ id: agents.id })
           .from(agents)

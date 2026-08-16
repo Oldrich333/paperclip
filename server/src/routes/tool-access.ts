@@ -1053,10 +1053,17 @@ export function toolAccessRoutes(
           companyId,
           actorType: "user",
           actorId: req.actor.userId ?? "board",
-          action: "tool_profile_binding.created",
+          action: req.body.bindingMode === "baseline"
+            ? "tool_profile_baseline_binding.created"
+            : "tool_profile_binding.created",
           entityType: "tool_profile_binding",
           entityId: binding.id,
-          details: { profileId: binding.profileId, targetType: binding.targetType, targetId: binding.targetId },
+          details: {
+            profileId: binding.profileId,
+            targetType: binding.targetType,
+            targetId: binding.targetId,
+            bindingMode: req.body.bindingMode,
+          },
         });
         res.status(201).json(binding);
       } catch (error) {
