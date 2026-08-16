@@ -2230,7 +2230,7 @@ rl.on("line", (line) => {
       });
       const call = {
         sessionToken: token.token,
-        gatewayId: namedGateway.id,
+        gatewayPublicId: namedGateway.gatewayPublicId,
         tool: "run_tool",
         parameters: {
           tool: targetToolName,
@@ -2262,7 +2262,7 @@ rl.on("line", (line) => {
       for (let attempt = 0; attempt < 100; attempt += 1) {
         terminalStatus = await gateway.executeTool({
           sessionToken: token.token,
-          gatewayId: namedGateway.id,
+          gatewayPublicId: namedGateway.gatewayPublicId,
           tool: "get_tool_run",
           parameters: { invocationId: started.invocationId },
         });
