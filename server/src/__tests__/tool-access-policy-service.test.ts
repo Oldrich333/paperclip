@@ -937,6 +937,41 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(replay.replayed).toBe(true);
   });
 
+  it("binds idempotency replay to authenticated non-agent subjects", async () => {
+    const company = await createCompany(db);
+    const issue = await createIssue(db, company.id, "User subject idempotency");
+    const { connection } = await createTool(db, company.id);
+    const base = {
+      companyId: company.id,
+      actor: { actorType: "user" as const, actorId: "user-a", agentId: null },
+      runContext: {
+        issueId: issue.id,
+        gatewayId: null,
+        clientSubjectType: "board_user" as const,
+        clientSubjectId: "user-a",
+      },
+      request: {
+        connectionId: connection.id,
+        toolName: "send_email",
+        arguments: { to: "ops@example.com", body: "once" },
+        idempotencyKey: "user-subject-idempotency-1",
+      },
+    };
+    const service = toolAccessPolicyService(db);
+    const decision = await service.decide(base);
+    const first = await service.recordInvocation(base, decision);
+    expect(await service.recordInvocation(base, decision)).toMatchObject({
+      replayed: true,
+      invocation: { id: first.invocation.id },
+    });
+
+    await expect(service.recordInvocation({
+      ...base,
+      actor: { actorType: "user" as const, actorId: "user-b", agentId: null },
+      runContext: { ...base.runContext, clientSubjectId: "user-b" },
+    }, decision)).rejects.toBeInstanceOf(ToolInvocationIdempotencyConflictError);
+  });
+
   it("enforces rate-limit policies before explicit grants", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

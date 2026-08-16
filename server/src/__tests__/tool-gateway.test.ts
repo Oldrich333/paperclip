@@ -2178,6 +2178,157 @@ rl.on("line", (line) => {
     }
   });
 
+  it("reconciles a restart-unknown run through its configured read-only receipt tool", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: {
+          content: [{ type: "text", text: JSON.stringify({ state: "not_applied", receiptId: "receipt-1" }) }],
+        },
+      },
+    }));
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "receipt-reconciliation",
+        toolName: "returns_parser",
+        url: fake.url,
+      });
+      const [receiptEntry] = await db.insert(toolCatalogEntries).values({
+        companyId: company.id,
+        applicationId: remoteTool.application.id,
+        connectionId: remoteTool.connection.id,
+        entryKind: "tool",
+        name: "get_receipt",
+        toolName: "get_receipt",
+        title: "Get parser receipt",
+        riskLevel: "read",
+        isReadOnly: true,
+        isWrite: false,
+        isDestructive: false,
+        status: "active",
+        versionHash: randomUUID(),
+        schemaHash: randomUUID(),
+      }).returning();
+      await db.update(toolConnections)
+        .set({
+          config: {
+            url: fake.url,
+            onDemandTools: { enabled: true },
+            reconciliation: {
+              receiptToolName: "get_receipt",
+              receiptArguments: { invocation: "${invocationId}", key: "${idempotencyKey}" },
+            },
+          },
+        })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const targetToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      const receiptToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: receiptEntry!.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [targetToolName, receiptToolName]);
+      const [unknown] = await db.insert(toolInvocations).values({
+        companyId: company.id,
+        idempotencyKey: "returns-restart-key",
+        actorType: "agent",
+        actorId: agent.id,
+        agentId: agent.id,
+        issueId: issue.id,
+        runId: run.id,
+        applicationId: remoteTool.application.id,
+        connectionId: remoteTool.connection.id,
+        catalogEntryId: remoteTool.catalogEntry.id,
+        providerType: "mcp_remote_http",
+        upstreamToolName: remoteTool.catalogEntry.toolName,
+        toolName: targetToolName,
+        argumentsHash: "returns-arguments",
+        riskLevel: "write",
+        status: "unknown",
+        errorCode: "tool_execution_lost_on_restart",
+        errorMessage: "lost",
+        completedAt: new Date(),
+      }).returning();
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const status = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "reconcile_tool_run",
+        parameters: { invocationId: unknown!.id },
+      });
+      expect(status.result).toMatchObject({
+        status: "failed",
+        terminal: true,
+        reconciliationRequired: false,
+        errorCode: "tool_not_applied_after_restart",
+        nextAction: "Retry with a new idempotency key.",
+      });
+      const [stored] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, unknown!.id));
+      expect(stored).toMatchObject({ status: "failed", resultPayload: { reconciliation: true, state: "not_applied" } });
+      expect(fake.requests).toHaveLength(1);
+      expect(fake.requests[0]?.body?.params).toMatchObject({ name: "get_receipt", arguments: { invocation: unknown!.id, key: "returns-restart-key" } });
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("reports when an unknown run has no configured receipt capability", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async () => ({
+      body: { jsonrpc: "2.0", result: { content: [{ type: "text", text: "unused" }] } },
+    }));
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "missing-receipt",
+        toolName: "returns_parser",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({ config: { url: fake.url, onDemandTools: { enabled: true } } })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const targetToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [targetToolName]);
+      const [unknown] = await db.insert(toolInvocations).values({
+        companyId: company.id,
+        idempotencyKey: "unknown-without-receipt",
+        actorType: "agent",
+        actorId: agent.id,
+        agentId: agent.id,
+        issueId: issue.id,
+        runId: run.id,
+        applicationId: remoteTool.application.id,
+        connectionId: remoteTool.connection.id,
+        catalogEntryId: remoteTool.catalogEntry.id,
+        toolName: targetToolName,
+        argumentsHash: "arguments",
+        status: "unknown",
+      }).returning();
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: "reconcile_tool_run",
+        parameters: { invocationId: unknown!.id },
+      })).rejects.toMatchObject({ status: 409, reasonCode: "reconciliation_unavailable" });
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("scopes async run_tool status to a named gateway and replays by idempotency key", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -2283,6 +2434,106 @@ rl.on("line", (line) => {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("scopes async status to the authenticated public-gateway subject", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "subject scoped" }] },
+      },
+    }));
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "public-subject-scope",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({ config: { url: fake.url, onDemandTools: { enabled: true } } })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const targetToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      const profile = await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const namedGateway = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: {
+          name: `Public subject gateway ${randomUUID()}`,
+          profileId: profile.id,
+          defaultProfileMode: "gateway_only",
+        },
+      });
+      const tokenA = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: {
+          name: "Subject A",
+          subjectType: "board_user",
+          subjectId: "subject-a",
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+      });
+      const tokenB = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: {
+          name: "Subject B",
+          subjectType: "board_user",
+          subjectId: "subject-b",
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+      });
+      const started = await gateway.executeTool({
+        sessionToken: tokenA.token,
+        gatewayPublicId: namedGateway.gatewayPublicId,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { key: "subject-key", value: "subject-value" },
+          async: true,
+          idempotencyKey: "public-subject-scope-1",
+        },
+      });
+      await expect(gateway.executeTool({
+        sessionToken: tokenB.token,
+        gatewayPublicId: namedGateway.gatewayPublicId,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { key: "subject-key", value: "subject-value" },
+          async: true,
+          idempotencyKey: "public-subject-scope-1",
+        },
+      })).rejects.toMatchObject({ status: 409, reasonCode: "idempotency_key_conflict" });
+      await expect(gateway.executeTool({
+        sessionToken: tokenB.token,
+        gatewayPublicId: namedGateway.gatewayPublicId,
+        tool: "get_tool_run",
+        parameters: { invocationId: started.invocationId },
+      })).rejects.toMatchObject({ status: 403, reasonCode: "invocation_scope_mismatch" });
+      const [stored] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, started.invocationId));
+      expect(stored).toMatchObject({ actorType: "user", actorId: "subject-a", clientSubjectType: "board_user", clientSubjectId: "subject-a" });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const completed = await gateway.executeTool({
+          sessionToken: tokenA.token,
+          gatewayPublicId: namedGateway.gatewayPublicId,
+          tool: "get_tool_run",
+          parameters: { invocationId: started.invocationId },
+        });
+        if ((completed.result as { terminal?: boolean }).terminal) break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
     } finally {
       await fake.close();
     }

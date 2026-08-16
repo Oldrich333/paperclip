@@ -47,6 +47,7 @@ import type {
   ToolMcpGatewayClientSnippet,
   ToolMcpGatewayToken,
   ToolMcpGatewayTokenAction,
+  ToolMcpGatewayTokenSubjectType,
   ToolMcpGatewayTokenCreated,
   ToolMcpGatewayWithTokens,
   UpdateToolMcpGateway,
@@ -104,6 +105,7 @@ const TOOL_EXECUTION_LOST_ERROR_MESSAGE =
   "Paperclip restarted before this tool call reached a durable terminal state. The provider may have applied the side effect; read its receipt or downstream state before retrying with a new idempotency key.";
 const TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION =
   "Read the provider receipt or downstream state before retrying with a new idempotency key.";
+const TOOL_RECONCILIATION_RECEIPT_STATES = new Set(["applied", "not_applied", "pending", "unknown"]);
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -182,6 +184,9 @@ export interface ToolGatewaySession {
   gatewayName?: string | null;
   gatewayTokenId?: string | null;
   gatewayTokenAllowedActions?: ToolMcpGatewayTokenAction[];
+  clientSubjectType?: ToolMcpGatewayTokenSubjectType | null;
+  clientSubjectId?: string | null;
+  clientName?: string | null;
   actorType?: "agent" | "user" | "system" | "plugin";
   actorId?: string | null;
   createdAt: Date;
@@ -276,6 +281,59 @@ type LocalStdioRuntimeTemplate = {
   args: string[];
   envKeys: string[];
 };
+
+type ToolReconciliationReceiptConfig = {
+  toolName: string;
+  arguments: Record<string, unknown>;
+};
+
+/**
+ * A connection may opt into restart reconciliation with
+ * `config.reconciliation.receiptToolName` and `receiptArguments`. The named
+ * catalog tool must be read-only; `${invocationId}`, `${idempotencyKey}`, and
+ * `${upstreamRequestId}` are the only substitutions. The tool must return
+ * `{ state: "applied" | "not_applied" | "pending" | "unknown" }`.
+ */
+function toolReconciliationReceiptConfig(connection: Pick<typeof toolConnections.$inferSelect, "config">): ToolReconciliationReceiptConfig | null {
+  const reconciliation = asRecord(asRecord(connection.config)?.reconciliation);
+  const toolName = stringValue(reconciliation?.receiptToolName);
+  if (!toolName) return null;
+  const args = asRecord(reconciliation?.receiptArguments) ?? {};
+  return { toolName, arguments: args };
+}
+
+function fillReconciliationReceiptArguments(value: unknown, invocation: typeof toolInvocations.$inferSelect): unknown {
+  if (typeof value === "string") {
+    const replacements: Record<string, string> = {
+      invocationId: invocation.id,
+      idempotencyKey: invocation.idempotencyKey ?? "",
+      upstreamRequestId: invocation.upstreamRequestId ?? "",
+    };
+    return value.replace(/\$\{(invocationId|idempotencyKey|upstreamRequestId)\}/g, (_match, key: string) => replacements[key] ?? "");
+  }
+  if (Array.isArray(value)) return value.map((entry) => fillReconciliationReceiptArguments(entry, invocation));
+  const record = asRecord(value);
+  if (!record) return value;
+  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [
+    key,
+    fillReconciliationReceiptArguments(entry, invocation),
+  ]));
+}
+
+function readReconciliationReceipt(result: unknown): { state: string; payload: unknown } | null {
+  const root = asRecord(result);
+  const data = asRecord(root?.data);
+  const structured = asRecord(data?.structuredContent);
+  const content = typeof root?.content === "string" ? root.content : null;
+  let contentRecord: Record<string, unknown> | null = null;
+  if (content) {
+    try { contentRecord = asRecord(JSON.parse(content)); } catch { contentRecord = null; }
+  }
+  const candidate = structured ?? contentRecord ?? root;
+  const state = stringValue(candidate?.state) ?? stringValue(candidate?.status);
+  if (!state || !TOOL_RECONCILIATION_RECEIPT_STATES.has(state)) return null;
+  return { state, payload: candidate };
+}
 
 const BUILTIN_LOCAL_STDIO_RUNTIME_TEMPLATES: Record<string, Omit<LocalStdioRuntimeTemplate, "templateId">> = {
   "paperclip.google-sheets": {
@@ -443,6 +501,11 @@ function rateLimitWindowStart(current: number, windowMs: number) {
 }
 
 function gatewaySessionFromRow(row: typeof toolGatewaySessions.$inferSelect): ToolGatewaySession {
+  const actorType: ToolGatewaySession["actorType"] = row.clientSubjectType === "board_user"
+    ? "user"
+    : row.clientSubjectType === "agent" || row.agentId
+      ? "agent"
+      : "system";
   return {
     id: row.id,
     token: "",
@@ -451,6 +514,14 @@ function gatewaySessionFromRow(row: typeof toolGatewaySessions.$inferSelect): To
     runId: row.runId,
     issueId: row.issueId,
     projectId: row.projectId,
+    gatewayId: row.gatewayId,
+    gatewayTokenId: row.gatewayTokenId,
+    gatewayPublicId: row.gatewayPublicId,
+    clientSubjectType: row.clientSubjectType,
+    clientSubjectId: row.clientSubjectId,
+    clientName: row.clientName,
+    actorType,
+    actorId: row.clientSubjectId ?? row.agentId ?? row.gatewayTokenId ?? row.companyId,
     createdAt: row.createdAt,
     expiresAt: row.expiresAt,
   };
@@ -801,7 +872,24 @@ const VIRTUAL_GET_TOOL_RUN: ToolGatewayDescriptor = {
   risk: "read",
 };
 
-const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL, VIRTUAL_GET_TOOL_RUN];
+const VIRTUAL_RECONCILE_TOOL_RUN: ToolGatewayDescriptor = {
+  name: "reconcile_tool_run",
+  displayName: "Reconcile a tool run",
+  description: "Use the connection's configured read-only provider receipt to resolve a run left unknown by a Paperclip restart before retrying it.",
+  parametersSchema: {
+    type: "object",
+    properties: {
+      invocationId: { type: "string", description: "The invocationId returned by run_tool." },
+    },
+    required: ["invocationId"],
+    additionalProperties: false,
+  },
+  pluginId: "paperclip-gateway",
+  providerType: "paperclip_virtual",
+  risk: "read",
+};
+
+const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL, VIRTUAL_GET_TOOL_RUN, VIRTUAL_RECONCILE_TOOL_RUN];
 
 export function createToolGatewayService(
   db: Db,
@@ -1846,6 +1934,10 @@ export function createToolGatewayService(
       projectId: input.session.projectId,
       gatewayId: input.session.gatewayId ?? null,
       gatewayPublicId: input.session.gatewayPublicId ?? null,
+      gatewayTokenId: input.session.gatewayTokenId ?? null,
+      clientSubjectType: input.session.clientSubjectType ?? null,
+      clientSubjectId: input.session.clientSubjectId ?? null,
+      clientName: input.session.clientName ?? null,
     });
   }
 
@@ -1863,6 +1955,10 @@ export function createToolGatewayService(
     projectId?: string | null;
     gatewayId?: string | null;
     gatewayPublicId?: string | null;
+    gatewayTokenId?: string | null;
+    clientSubjectType?: ToolMcpGatewayTokenSubjectType | null;
+    clientSubjectId?: string | null;
+    clientName?: string | null;
   }): ToolAccessDecisionInput {
     const actorType = input.actorType ?? (input.agentId ? "agent" : "system");
     const actorId = input.actorId ?? input.agentId ?? input.gatewayId ?? input.companyId;
@@ -1879,6 +1975,10 @@ export function createToolGatewayService(
         projectId: input.projectId ?? null,
         gatewayId: input.gatewayId ?? null,
         gatewayPublicId: input.gatewayPublicId ?? null,
+        gatewayTokenId: input.gatewayTokenId ?? null,
+        clientSubjectType: input.clientSubjectType ?? null,
+        clientSubjectId: input.clientSubjectId ?? null,
+        clientName: input.clientName ?? null,
       },
       request: {
         toolName: input.tool.name,
@@ -1964,6 +2064,17 @@ export function createToolGatewayService(
       throw new ToolGatewayHttpError(400, "get_tool_run requires a valid invocationId", "invalid_parameters");
     }
     return invocationId;
+  }
+
+  function invocationMatchesSession(invocation: typeof toolInvocations.$inferSelect, session: ToolGatewaySession): boolean {
+    return invocation.agentId === session.agentId
+      && invocation.issueId === session.issueId
+      && invocation.gatewayId === (session.gatewayId ?? null)
+      && invocation.actorType === (session.actorType ?? (session.agentId ? "agent" : "system"))
+      && invocation.actorId === (session.actorId ?? session.agentId ?? session.gatewayTokenId ?? session.companyId)
+      && (!invocation.gatewayTokenId || !session.gatewayTokenId || invocation.gatewayTokenId === session.gatewayTokenId)
+      && (!invocation.clientSubjectType || !session.clientSubjectType || invocation.clientSubjectType === session.clientSubjectType)
+      && (!invocation.clientSubjectId || !session.clientSubjectId || invocation.clientSubjectId === session.clientSubjectId);
   }
 
   async function searchableOnDemandTools(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
@@ -3797,8 +3908,15 @@ export function createToolGatewayService(
       gatewayName: row.gateway.name,
       gatewayTokenId: row.token.id || tokenId,
       gatewayTokenAllowedActions: normalizeGatewayTokenActions(row.token.allowedActions),
-      actorType: runId ? "agent" : "system",
-      actorId: runId ? agentId : row.token.id,
+      clientSubjectType: row.token.subjectType,
+      clientSubjectId: row.token.subjectId,
+      clientName: row.token.clientLabel,
+      actorType: runId || row.token.subjectType === "agent"
+        ? "agent"
+        : row.token.subjectType === "board_user" ? "user" : "system",
+      actorId: runId || row.token.subjectType === "agent"
+        ? agentId
+        : row.token.subjectId ?? row.token.id,
       createdAt: row.token.createdAt,
       expiresAt: row.token.expiresAt ?? new Date(Date.now() + 3650 * 24 * 60 * 60 * 1000),
     };
@@ -4885,6 +5003,10 @@ export function createToolGatewayService(
         runId: input.runId,
         issueId,
         projectId,
+        clientSubjectType: input.actorType === "user" ? "board_user" : "agent",
+        clientSubjectId: input.actorId ?? input.agentId,
+        actorType: input.actorType ?? "agent",
+        actorId: input.actorId ?? input.agentId,
         createdAt: now,
         expiresAt: new Date(now.getTime() + sessionTtlMs(input.ttlMs)),
       };
@@ -4896,6 +5018,9 @@ export function createToolGatewayService(
         runId: input.runId,
         issueId: session.issueId,
         projectId: session.projectId,
+        clientSubjectType: session.clientSubjectType,
+        clientSubjectId: session.clientSubjectId,
+        clientName: session.clientName,
         tokenHash: hashGatewayToken(token),
         expiresAt: session.expiresAt,
         createdAt: session.createdAt,
@@ -5448,11 +5573,15 @@ export function createToolGatewayService(
             invocationId: targetInvocationId,
           });
         }
-        if (
-          invocation.agentId !== session.agentId
-          || invocation.issueId !== session.issueId
-          || invocation.gatewayId !== (session.gatewayId ?? null)
-        ) {
+        const receiptConnection = invocation.connectionId
+          ? await db
+            .select({ config: toolConnections.config })
+            .from(toolConnections)
+            .where(and(eq(toolConnections.id, invocation.connectionId), eq(toolConnections.companyId, session.companyId)))
+            .limit(1)
+          : [];
+        const receiptConfigured = Boolean(receiptConnection[0] && toolReconciliationReceiptConfig(receiptConnection[0]));
+        if (!invocationMatchesSession(invocation, session)) {
           throw new ToolGatewayHttpError(403, "Tool invocation is outside the authenticated run scope", "invocation_scope_mismatch");
         }
         const terminal = TERMINAL_TOOL_INVOCATION_STATUSES.has(invocation.status);
@@ -5469,9 +5598,248 @@ export function createToolGatewayService(
             errorCode: invocation.errorCode ?? null,
             errorMessage: invocation.errorMessage ?? null,
             reconciliationRequired: invocation.status === "unknown",
+            reconciliationAvailable: invocation.status === "unknown" && receiptConfigured,
             nextAction: invocation.status === "unknown"
               ? TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION
               : null,
+          },
+        };
+      }
+
+      if (tool.name === "reconcile_tool_run" && tool.providerType === "paperclip_virtual") {
+        const targetInvocationId = virtualToolRunStatus(requestedParameters);
+        const [invocation] = await db
+          .select()
+          .from(toolInvocations)
+          .where(and(
+            eq(toolInvocations.id, targetInvocationId),
+            eq(toolInvocations.companyId, session.companyId),
+          ))
+          .limit(1);
+        if (!invocation) {
+          throw new ToolGatewayHttpError(404, "Tool invocation not found", "invocation_not_found", {
+            invocationId: targetInvocationId,
+          });
+        }
+        if (!invocationMatchesSession(invocation, session)) {
+          throw new ToolGatewayHttpError(403, "Tool invocation is outside the authenticated run scope", "invocation_scope_mismatch");
+        }
+        if (invocation.status !== "unknown") {
+          return {
+            invocationId: invocation.id,
+            status: "completed" as const,
+            tool: "reconcile_tool_run",
+            result: {
+              invocationId: invocation.id,
+              tool: invocation.toolName,
+              status: invocation.status,
+              terminal: TERMINAL_TOOL_INVOCATION_STATUSES.has(invocation.status),
+              reconciliationRequired: false,
+              result: storedInvocationResult(invocation),
+              errorCode: invocation.errorCode ?? null,
+              errorMessage: invocation.errorMessage ?? null,
+            },
+          };
+        }
+        if (!invocation.connectionId) {
+          throw new ToolGatewayHttpError(409, "This unknown tool run has no downstream receipt connection", "reconciliation_unavailable", {
+            invocationId: invocation.id,
+            reconciliationRequired: true,
+            nextAction: TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION,
+          });
+        }
+        const [connection] = await db
+          .select()
+          .from(toolConnections)
+          .where(and(eq(toolConnections.id, invocation.connectionId), eq(toolConnections.companyId, session.companyId)))
+          .limit(1);
+        const receiptConfig = connection ? toolReconciliationReceiptConfig(connection) : null;
+        if (!connection || !receiptConfig) {
+          throw new ToolGatewayHttpError(409, "This connection has no configured read-only downstream receipt tool", "reconciliation_unavailable", {
+            invocationId: invocation.id,
+            reconciliationRequired: true,
+            nextAction: TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION,
+          });
+        }
+        const receiptTool = (await connectedMcpToolsForConnection(session.companyId, connection.id))
+          .find((candidate) => candidate.name === receiptConfig.toolName || candidate.upstreamToolName === receiptConfig.toolName);
+        if (!receiptTool || receiptTool.providerType !== "mcp_remote_http" || receiptTool.risk !== "read") {
+          throw new ToolGatewayHttpError(409, "The configured downstream receipt tool is not an active read-only remote tool", "reconciliation_unavailable", {
+            invocationId: invocation.id,
+            receiptTool: receiptConfig.toolName,
+            reconciliationRequired: true,
+            nextAction: TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION,
+          });
+        }
+
+        const receiptParameters = fillReconciliationReceiptArguments(receiptConfig.arguments, invocation);
+        const receiptDecisionInput = policyInputForTool({
+          session,
+          tool: receiptTool,
+          parameters: receiptParameters,
+          idempotencyKey: `reconciliation:${invocation.id}`,
+          consumeRateLimit: true,
+        });
+        const receiptDecision = await policyService.decide(receiptDecisionInput);
+        await policyService.writeAudit(receiptDecisionInput, receiptDecision);
+        if (!receiptDecision.allowed) {
+          throw new ToolGatewayHttpError(
+            policyErrorStatus(receiptDecision),
+            receiptDecision.explanation,
+            receiptDecision.reasonCode,
+            { invocationId: invocation.id, receiptTool: receiptTool.name },
+          );
+        }
+        const recordedReceipt = await recordToolInvocation(receiptDecisionInput, receiptDecision);
+        let receiptResult: unknown;
+        if (recordedReceipt.replayed) {
+          receiptResult = storedInvocationResult(recordedReceipt.invocation);
+        } else {
+          await db.update(toolInvocations).set({
+            status: "executing",
+            startedAt: new Date(),
+            updatedAt: new Date(),
+          }).where(eq(toolInvocations.id, recordedReceipt.invocation.id));
+          try {
+            const executedReceipt = await executeRemoteHttpTool(
+              session,
+              receiptTool,
+              receiptParameters,
+              MAX_TOOL_TIMEOUT_MS,
+              recordedReceipt.invocation.id,
+              input.callerHeaders,
+            );
+            const receiptValidation = validateToolContent({
+              value: executedReceipt.result,
+              direction: "result",
+              sensitiveMode: "redact",
+              promptInjectionMode: "block",
+            });
+            const storedReceipt = completeStoredToolResult(receiptValidation);
+            await db.update(toolInvocations).set({
+              status: "succeeded",
+              resultHash: receiptValidation.summary.sha256 ?? null,
+              resultSummary: receiptValidation.summary,
+              resultPayload: storedReceipt,
+              resultSizeBytes: receiptValidation.summary.sizeBytes ?? null,
+              completedAt: new Date(),
+              updatedAt: new Date(),
+            }).where(eq(toolInvocations.id, recordedReceipt.invocation.id));
+            await writeToolCallEvent({
+              invocationId: recordedReceipt.invocation.id,
+              session,
+              eventType: "call_completed",
+              outcome: "success",
+              toolName: receiptTool.name,
+              policyDecision: "allow",
+              reasonCode: "reconciliation_receipt_read",
+              argumentsSummary: recordedReceipt.invocation.argumentsSummary,
+              resultSummary: receiptValidation.summary,
+              metadata: { reconciliationForInvocationId: invocation.id },
+              tool: receiptTool,
+            });
+            await writeAudit({
+              session,
+              companyId: session.companyId,
+              agentId: session.agentId,
+              runId: session.runId,
+              issueId: session.issueId,
+              action: "tool_gateway.call_completed",
+              details: {
+                invocationId: recordedReceipt.invocation.id,
+                decision: "allow",
+                reasonCode: "reconciliation_receipt_read",
+                tool: receiptTool.name,
+                reconciliationForInvocationId: invocation.id,
+                resultSummary: receiptValidation.summary,
+              },
+            });
+            receiptResult = executedReceipt.result;
+          } catch (error) {
+            const reasonCode = error instanceof ToolGatewayHttpError ? error.reasonCode : "reconciliation_receipt_failed";
+            const message = error instanceof Error ? error.message : String(error);
+            await db.update(toolInvocations).set({
+              status: error instanceof ToolGatewayHttpError && error.status === 504 ? "timed_out" : "failed",
+              errorCode: reasonCode,
+              errorMessage: message,
+              completedAt: new Date(),
+              updatedAt: new Date(),
+            }).where(eq(toolInvocations.id, recordedReceipt.invocation.id));
+            await writeToolCallEvent({
+              invocationId: recordedReceipt.invocation.id,
+              session,
+              eventType: "call_failed",
+              outcome: error instanceof ToolGatewayHttpError && error.status === 504 ? "timeout" : "failure",
+              toolName: receiptTool.name,
+              policyDecision: "defer_runtime",
+              reasonCode,
+              argumentsSummary: recordedReceipt.invocation.argumentsSummary,
+              metadata: { reconciliationForInvocationId: invocation.id },
+              tool: receiptTool,
+            });
+            await writeAudit({
+              session,
+              companyId: session.companyId,
+              agentId: session.agentId,
+              runId: session.runId,
+              issueId: session.issueId,
+              action: "tool_gateway.call_failed",
+              details: {
+                invocationId: recordedReceipt.invocation.id,
+                decision: "defer_runtime",
+                reasonCode,
+                tool: receiptTool.name,
+                reconciliationForInvocationId: invocation.id,
+              },
+            });
+            throw error;
+          }
+        }
+        const receipt = readReconciliationReceipt(receiptResult);
+        if (!receipt) {
+          throw new ToolGatewayHttpError(502, "The downstream receipt tool returned no recognized reconciliation state", "reconciliation_receipt_invalid", {
+            invocationId: invocation.id,
+            receiptTool: receiptTool.name,
+          });
+        }
+        const receiptValidation = validateToolContent({
+          value: { reconciliation: true, state: receipt.state, receipt: receipt.payload },
+          direction: "result",
+          sensitiveMode: "redact",
+          promptInjectionMode: "block",
+        });
+        const resultPayload = completeStoredToolResult(receiptValidation);
+        const terminalState = receipt.state === "applied" || receipt.state === "not_applied";
+        const resolvedStatus = receipt.state === "applied" ? "succeeded" : receipt.state === "not_applied" ? "failed" : "unknown";
+        await db.update(toolInvocations).set({
+          status: resolvedStatus,
+          resultHash: receiptValidation.summary.sha256 ?? null,
+          resultSummary: receiptValidation.summary,
+          resultPayload,
+          resultSizeBytes: receiptValidation.summary.sizeBytes ?? null,
+          errorCode: receipt.state === "not_applied" ? "tool_not_applied_after_restart" : receipt.state === "unknown" ? "reconciliation_pending" : null,
+          errorMessage: receipt.state === "not_applied"
+            ? "The provider confirmed that the original call was not applied; retry only with a new idempotency key."
+            : receipt.state === "unknown" ? TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION : null,
+          completedAt: terminalState ? new Date() : invocation.completedAt,
+          updatedAt: new Date(),
+        }).where(eq(toolInvocations.id, invocation.id));
+        return {
+          invocationId: invocation.id,
+          status: "completed" as const,
+          tool: "reconcile_tool_run",
+          result: {
+            invocationId: invocation.id,
+            tool: invocation.toolName,
+            status: resolvedStatus,
+            terminal: terminalState,
+            reconciliationRequired: !terminalState,
+            result: resultPayload,
+            errorCode: receipt.state === "not_applied" ? "tool_not_applied_after_restart" : null,
+            errorMessage: receipt.state === "not_applied"
+              ? "The provider confirmed that the original call was not applied; retry only with a new idempotency key."
+              : null,
+            nextAction: receipt.state === "not_applied" ? "Retry with a new idempotency key." : !terminalState ? TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION : null,
           },
         };
       }
@@ -5498,6 +5866,12 @@ export function createToolGatewayService(
           agentId: session.agentId,
           issueId: session.issueId,
           runId: session.runId,
+          gatewayId: session.gatewayId ?? null,
+          gatewayTokenId: session.gatewayTokenId ?? null,
+          gatewayPublicId: session.gatewayPublicId ?? null,
+          clientSubjectType: session.clientSubjectType ?? null,
+          clientSubjectId: session.clientSubjectId ?? null,
+          clientName: session.clientName ?? null,
           providerType: "paperclip_virtual",
           upstreamToolName: "search_tools",
           riskLevel: "read",

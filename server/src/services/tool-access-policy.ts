@@ -39,6 +39,7 @@ import type {
   ToolRedactedValueSummary,
   ToolTrustRuleArgumentFilters,
   ToolRiskLevel,
+  ToolMcpGatewayTokenSubjectType,
 } from "@paperclipai/shared";
 import { toolPolicyConditionsSchema } from "@paperclipai/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../errors.js";
@@ -56,6 +57,9 @@ type ToolAccessContext = {
   routineId: string | null;
   gatewayId: string | null;
   gatewayPublicId: string | null;
+  gatewayTokenId: string | null;
+  clientSubjectType: ToolMcpGatewayTokenSubjectType | null;
+  clientSubjectId: string | null;
   applicationId: string | null;
   connectionId: string | null;
   catalogEntryId: string | null;
@@ -85,9 +89,14 @@ function invocationMatchesIdempotency(
 ) {
   return invocation.toolName === ctx.toolName
     && invocation.argumentsHash === argumentsHash
+    && invocation.actorType === ctx.actorType
+    && invocation.actorId === ctx.actorId
     && invocation.agentId === ctx.agentId
     && invocation.issueId === ctx.issueId
     && invocation.gatewayId === ctx.gatewayId
+    && (!invocation.gatewayTokenId || !ctx.gatewayTokenId || invocation.gatewayTokenId === ctx.gatewayTokenId)
+    && (!invocation.clientSubjectType || !ctx.clientSubjectType || invocation.clientSubjectType === ctx.clientSubjectType)
+    && (!invocation.clientSubjectId || !ctx.clientSubjectId || invocation.clientSubjectId === ctx.clientSubjectId)
     && invocation.applicationId === ctx.applicationId
     && invocation.connectionId === ctx.connectionId
     && invocation.catalogEntryId === ctx.catalogEntryId;
@@ -869,6 +878,9 @@ export function toolAccessPolicyService(db: Db) {
     let routineId = input.runContext?.routineId ?? null;
     const gatewayId = input.runContext?.gatewayId ?? null;
     const gatewayPublicId = input.runContext?.gatewayPublicId ?? null;
+    const gatewayTokenId = input.runContext?.gatewayTokenId ?? null;
+    const clientSubjectType = input.runContext?.clientSubjectType ?? null;
+    const clientSubjectId = input.runContext?.clientSubjectId ?? null;
 
     if (input.actor.actorType === "agent") {
       const [agent] = await db.select().from(agents).where(and(eq(agents.id, agentId ?? ""), eq(agents.companyId, input.companyId)));
@@ -1008,6 +1020,9 @@ export function toolAccessPolicyService(db: Db) {
         routineId,
         gatewayId,
         gatewayPublicId,
+        gatewayTokenId,
+        clientSubjectType,
+        clientSubjectId,
         applicationId,
         connectionId,
         catalogEntryId,
@@ -1019,7 +1034,7 @@ export function toolAccessPolicyService(db: Db) {
         upstreamToolName,
         toolName: input.request.toolName,
         riskLevel,
-        argumentsHash: redaction.summary.sha256 ?? sha256(input.request.arguments ?? {}),
+        argumentsHash: sha256(input.request.arguments ?? {}),
         arguments: input.request.arguments ?? {},
       },
     };
@@ -1318,6 +1333,9 @@ export function toolAccessPolicyService(db: Db) {
       issueId: input.runContext?.issueId ?? null,
       gatewayId: input.runContext?.gatewayId ?? null,
       gatewayPublicId: input.runContext?.gatewayPublicId ?? null,
+      gatewayTokenId: input.runContext?.gatewayTokenId ?? null,
+      clientSubjectType: input.runContext?.clientSubjectType ?? null,
+      clientSubjectId: input.runContext?.clientSubjectId ?? null,
       runId: input.runContext?.heartbeatRunId ?? null,
       connectionId: input.request.connectionId ?? null,
       catalogEntryId: input.request.catalogEntryId ?? null,
@@ -1401,7 +1419,7 @@ export function toolAccessPolicyService(db: Db) {
     const loaded = await loadContext(input);
     if (!loaded.ok) throw new Error("Cannot record invocation for invalid tool access context");
     const { ctx, redaction } = loaded;
-    const argumentsHash = redaction.summary.sha256 ?? sha256(input.request.arguments ?? {});
+    const argumentsHash = sha256(input.request.arguments ?? {});
     const idempotencyKey = input.request.idempotencyKey
       ?? (input.request.sideEffecting ? sideEffectIdempotencyKey(ctx, argumentsHash) : null);
     if (idempotencyKey) {
@@ -1431,6 +1449,9 @@ export function toolAccessPolicyService(db: Db) {
       runId: ctx.heartbeatRunId,
       gatewayId: ctx.gatewayId,
       gatewayPublicId: ctx.gatewayPublicId,
+      gatewayTokenId: ctx.gatewayTokenId,
+      clientSubjectType: ctx.clientSubjectType,
+      clientSubjectId: ctx.clientSubjectId,
       applicationId: ctx.applicationId,
       connectionId: ctx.connectionId,
       catalogEntryId: ctx.catalogEntryId,
@@ -1533,6 +1554,9 @@ export function toolAccessPolicyService(db: Db) {
         routineId: null,
         gatewayId: null,
         gatewayPublicId: null,
+        gatewayTokenId: invocation.gatewayTokenId,
+        clientSubjectType: invocation.clientSubjectType,
+        clientSubjectId: invocation.clientSubjectId,
         applicationId: invocation.applicationId,
         connectionId: invocation.connectionId,
         catalogEntryId: invocation.catalogEntryId,
