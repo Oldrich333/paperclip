@@ -51,11 +51,20 @@ function isRequiredCompanyBaseline(binding: BindingLike): boolean {
  * Do not use this helper for connection-token mint authority, where strict narrowest-scope
  * replacement remains a privilege boundary.
  */
-export function effectiveScopeBindings<T extends BindingLike>(bindings: T[]): T[] {
+export function effectiveScopeBindings<T extends BindingLike>(
+  bindings: T[],
+  boundaryTargetType: "gateway" | null = null,
+): T[] {
   const contextual = narrowestScopeBindings(bindings);
   // A named gateway is an explicit external capability boundary. It receives
   // only profiles bound to that gateway; founder/operator gateways that need
-  // company memory must bind the memory profile explicitly.
+  // company memory must bind the memory profile explicitly. The boundary is
+  // derived from the authenticated run context, not from the continued
+  // existence of a binding row: removing the last gateway binding must leave
+  // the gateway deny-by-default rather than exposing agent/company profiles.
+  if (boundaryTargetType === "gateway") {
+    return contextual.filter((binding) => binding.targetType === "gateway");
+  }
   if (contextual.length === 0 || contextual[0]?.targetType === "company" || contextual[0]?.targetType === "gateway") {
     return contextual;
   }

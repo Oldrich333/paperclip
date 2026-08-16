@@ -63,4 +63,11 @@ describe("narrowestScopeBindings", () => {
       binding("gateway-working-set", "gateway"),
     ]).map((row) => row.profileId)).toEqual(["gateway-working-set"]);
   });
+
+  it("keeps an authenticated named gateway closed after its last explicit binding is removed", () => {
+    expect(effectiveScopeBindings([
+      binding("memory-foundation", "company", 100, { bindingMode: "baseline" }),
+      binding("agent-working-set", "agent"),
+    ], "gateway")).toEqual([]);
+  });
 });
