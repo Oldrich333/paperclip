@@ -1804,6 +1804,7 @@ export function createToolGatewayService(
       issueId: input.session.issueId,
       projectId: input.session.projectId,
       gatewayId: input.session.gatewayId ?? null,
+      gatewayPublicId: input.session.gatewayPublicId ?? null,
     });
   }
 
@@ -1820,6 +1821,7 @@ export function createToolGatewayService(
     issueId?: string | null;
     projectId?: string | null;
     gatewayId?: string | null;
+    gatewayPublicId?: string | null;
   }): ToolAccessDecisionInput {
     const actorType = input.actorType ?? (input.agentId ? "agent" : "system");
     const actorId = input.actorId ?? input.agentId ?? input.gatewayId ?? input.companyId;
@@ -1835,6 +1837,7 @@ export function createToolGatewayService(
         issueId: input.issueId ?? null,
         projectId: input.projectId ?? null,
         gatewayId: input.gatewayId ?? null,
+        gatewayPublicId: input.gatewayPublicId ?? null,
       },
       request: {
         toolName: input.tool.name,
@@ -5402,8 +5405,7 @@ export function createToolGatewayService(
           invocation.agentId !== session.agentId
           || invocation.runId !== session.runId
           || invocation.issueId !== session.issueId
-          || (session.gatewayId && invocation.gatewayId !== session.gatewayId)
-          || (session.gatewayPublicId && invocation.gatewayPublicId !== session.gatewayPublicId)
+          || invocation.gatewayId !== (session.gatewayId ?? null)
         ) {
           throw new ToolGatewayHttpError(403, "Tool invocation is outside the authenticated run scope", "invocation_scope_mismatch");
         }

@@ -55,6 +55,7 @@ type ToolAccessContext = {
   projectId: string | null;
   routineId: string | null;
   gatewayId: string | null;
+  gatewayPublicId: string | null;
   applicationId: string | null;
   connectionId: string | null;
   catalogEntryId: string | null;
@@ -845,6 +846,7 @@ export function toolAccessPolicyService(db: Db) {
     let projectId = input.runContext?.projectId ?? null;
     let routineId = input.runContext?.routineId ?? null;
     const gatewayId = input.runContext?.gatewayId ?? null;
+    const gatewayPublicId = input.runContext?.gatewayPublicId ?? null;
 
     if (input.actor.actorType === "agent") {
       const [agent] = await db.select().from(agents).where(and(eq(agents.id, agentId ?? ""), eq(agents.companyId, input.companyId)));
@@ -983,6 +985,7 @@ export function toolAccessPolicyService(db: Db) {
         projectId,
         routineId,
         gatewayId,
+        gatewayPublicId,
         applicationId,
         connectionId,
         catalogEntryId,
@@ -1292,6 +1295,7 @@ export function toolAccessPolicyService(db: Db) {
       agentId: input.actor.agentId ?? null,
       issueId: input.runContext?.issueId ?? null,
       gatewayId: input.runContext?.gatewayId ?? null,
+      gatewayPublicId: input.runContext?.gatewayPublicId ?? null,
       runId: input.runContext?.heartbeatRunId ?? null,
       connectionId: input.request.connectionId ?? null,
       catalogEntryId: input.request.catalogEntryId ?? null,
@@ -1400,6 +1404,8 @@ export function toolAccessPolicyService(db: Db) {
       agentId: ctx.agentId,
       issueId: ctx.issueId,
       runId: ctx.heartbeatRunId,
+      gatewayId: ctx.gatewayId,
+      gatewayPublicId: ctx.gatewayPublicId,
       applicationId: ctx.applicationId,
       connectionId: ctx.connectionId,
       catalogEntryId: ctx.catalogEntryId,
@@ -1498,6 +1504,7 @@ export function toolAccessPolicyService(db: Db) {
         projectId: invocation.issueId ? issueProjectById.get(invocation.issueId) ?? null : null,
         routineId: null,
         gatewayId: null,
+        gatewayPublicId: null,
         applicationId: invocation.applicationId,
         connectionId: invocation.connectionId,
         catalogEntryId: invocation.catalogEntryId,

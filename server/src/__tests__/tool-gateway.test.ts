@@ -2154,6 +2154,116 @@ rl.on("line", (line) => {
     }
   });
 
+  it("scopes async run_tool status to a named gateway and replays by idempotency key", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: "named gateway async ok" }] },
+        },
+      };
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "named-gateway-async-demo",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({ config: { url: fake.url, onDemandTools: { enabled: true } } })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      const targetToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      const profile = await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const namedGateway = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: {
+          name: `Async gateway ${randomUUID()}`,
+          profileId: profile.id,
+          defaultProfileMode: "gateway_only",
+        },
+      });
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: {
+          name: "Async run token",
+          subjectType: "heartbeat_run",
+          subjectId: run.id,
+          allowedActions: ["tools/list", "tools/call"],
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+        actor: { agentId: agent.id },
+      });
+      const call = {
+        sessionToken: token.token,
+        gatewayId: namedGateway.id,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { key: "named-key", value: "named-value" },
+          async: true,
+          idempotencyKey: "named-gateway-async-1",
+        },
+      };
+
+      const started = await gateway.executeTool(call);
+      expect(started).toMatchObject({ status: "started", tool: "run_tool", targetTool: targetToolName });
+      const replay = await gateway.executeTool(call);
+      expect(replay).toMatchObject({ status: "replayed", invocationId: started.invocationId });
+
+      const [stored] = await db
+        .select()
+        .from(toolInvocations)
+        .where(eq(toolInvocations.id, started.invocationId));
+      expect(stored).toMatchObject({
+        companyId: company.id,
+        agentId: agent.id,
+        runId: run.id,
+        issueId: expect.any(String),
+        gatewayId: namedGateway.id,
+        gatewayPublicId: namedGateway.gatewayPublicId,
+      });
+
+      let terminalStatus: Awaited<ReturnType<typeof gateway.executeTool>>;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        terminalStatus = await gateway.executeTool({
+          sessionToken: token.token,
+          gatewayId: namedGateway.id,
+          tool: "get_tool_run",
+          parameters: { invocationId: started.invocationId },
+        });
+        const status = (terminalStatus.result as { status?: string }).status;
+        if (["succeeded", "failed", "timed_out"].includes(status ?? "")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(terminalStatus!.result).toMatchObject({ status: "succeeded", terminal: true });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const completionAudits = await db
+          .select()
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.runId, run.id),
+            eq(activityLog.action, "tool_gateway.call_completed"),
+          ));
+        if (completionAudits.length >= 2) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("discovers and calls the SDK-backed KV demo MCP server over Streamable HTTP", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
