@@ -5677,7 +5677,6 @@ export function createToolGatewayService(
           session,
           tool: receiptTool,
           parameters: receiptParameters,
-          idempotencyKey: `reconciliation:${invocation.id}`,
           consumeRateLimit: true,
         });
         const receiptDecision = await policyService.decide(receiptDecisionInput);

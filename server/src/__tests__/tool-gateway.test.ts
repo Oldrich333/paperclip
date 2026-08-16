@@ -2207,15 +2207,18 @@ rl.on("line", (line) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
-    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => ({
-      body: {
-        jsonrpc: "2.0",
-        id: fakeRequest.body?.id,
-        result: {
-          content: [{ type: "text", text: JSON.stringify({ state: "not_applied", receiptId: "receipt-1" }) }],
+    let receiptReads = 0;
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+      receiptReads += 1;
+      const state = receiptReads === 1 ? "pending" : "not_applied";
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: JSON.stringify({ state, receiptId: "receipt-1" }) }] },
         },
-      },
-    }));
+      };
+    });
     try {
       const remoteTool = await createRemoteMcpTool(db, company.id, {
         applicationKey: "receipt-reconciliation",
@@ -2284,6 +2287,12 @@ rl.on("line", (line) => {
       }).returning();
       const gateway = createTestToolGatewayService(db);
       const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const pending = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "reconcile_tool_run",
+        parameters: { invocationId: unknown!.id },
+      });
+      expect(pending.result).toMatchObject({ status: "unknown", terminal: false, reconciliationRequired: true });
       const status = await gateway.executeTool({
         sessionToken: session.token,
         tool: "reconcile_tool_run",
@@ -2298,7 +2307,7 @@ rl.on("line", (line) => {
       });
       const [stored] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, unknown!.id));
       expect(stored).toMatchObject({ status: "failed", resultPayload: { reconciliation: true, state: "not_applied" } });
-      expect(fake.requests).toHaveLength(1);
+      expect(fake.requests).toHaveLength(2);
       expect(fake.requests[0]?.body?.params).toMatchObject({ name: "get_receipt", arguments: { invocation: unknown!.id, key: "returns-restart-key" } });
     } finally {
       await fake.close();
