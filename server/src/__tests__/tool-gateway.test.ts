@@ -131,13 +131,38 @@ async function allowToolsForAgent(db: Db, companyId: string, agentId: string, to
     targetId: agentId,
   });
   if (toolNames.length > 0) {
-    await db.insert(toolProfileEntries).values(toolNames.map((toolName) => ({
-      companyId,
-      profileId: profile.id,
-      selectorType: "tool_name" as const,
-      effect: "include" as const,
-      toolName,
-    })));
+    const catalogEntries = await db
+      .select({
+        id: toolCatalogEntries.id,
+        toolName: toolCatalogEntries.toolName,
+        connectionId: toolCatalogEntries.connectionId,
+        applicationKey: toolApplications.applicationKey,
+      })
+      .from(toolCatalogEntries)
+      .leftJoin(toolApplications, eq(toolApplications.id, toolCatalogEntries.applicationId))
+      .where(eq(toolCatalogEntries.companyId, companyId));
+    await db.insert(toolProfileEntries).values(toolNames.map((toolName) => {
+      const catalogEntry = catalogEntries.find((entry) => entry.connectionId && expectedConnectedToolName({
+        applicationKey: entry.applicationKey,
+        connectionId: entry.connectionId,
+        toolName: entry.toolName,
+      }) === toolName);
+      return catalogEntry
+        ? {
+            companyId,
+            profileId: profile.id,
+            selectorType: "catalog_entry" as const,
+            effect: "include" as const,
+            catalogEntryId: catalogEntry.id,
+          }
+        : {
+            companyId,
+            profileId: profile.id,
+            selectorType: "tool_name" as const,
+            effect: "include" as const,
+            toolName,
+          };
+    }));
   }
   return profile;
 }
@@ -906,9 +931,9 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       await db.insert(toolProfileEntries).values({
         companyId: company.id,
         profileId: profile.id,
-        selectorType: "tool_name",
+        selectorType: "catalog_entry",
         effect: "include",
-        toolName: gatewayToolName,
+        catalogEntryId: catalogEntry.id,
       });
       const gateway = createTestToolGatewayService(db, {
         mcpGatewayProtocolLimits: {
