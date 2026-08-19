@@ -37,6 +37,32 @@ describe("adapter session codecs", () => {
     expect(claudeSessionCodec.getDisplayId?.(serialized ?? null)).toBe("claude-session-1");
   });
 
+  it("round-trips CLI MCP and remote execution session identity", () => {
+    const input = {
+      sessionId: "claude-session-identity",
+      cwd: "/tmp/claude",
+      promptBundleKey: "bundle-identity",
+      mcpServerIdentity: JSON.stringify([
+        {
+          name: "gateway",
+          url: "https://paperclip.example/gateway/mcp",
+          connectionId: "connection-1",
+        },
+      ]),
+      remoteExecution: {
+        transport: "sandbox",
+        providerKey: "provider-1",
+        environmentId: "environment-1",
+        leaseId: "lease-1",
+        remoteCwd: "/workspace",
+      },
+    };
+
+    const serialized = claudeSessionCodec.serialize(input);
+    expect(serialized).toMatchObject(input);
+    expect(claudeSessionCodec.deserialize(serialized)).toMatchObject(input);
+  });
+
   it("preserves claude ACP session params for ACP lane resumes", () => {
     const parsed = claudeSessionCodec.deserialize({
       sessionKey: "paperclip:company:agent:task:fingerprint",
