@@ -1,3 +1,4 @@
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -126,10 +127,10 @@ describe("claude_local subscription profile isolation", () => {
     );
   });
 
-  it("resolves a relative local profile from the Claude process working directory", async () => {
+  it("normalizes a relative local profile independently of the agent workspace", async () => {
     const workspaceDir = "/var/tmp/paperclip-agent-workspace";
     const relativeDir = "../claude-profiles/account-b/.claude";
-    const expectedDir = "/var/tmp/claude-profiles/account-b/.claude";
+    const expectedDir = path.resolve(relativeDir);
 
     const result = await execute(buildContext({
       config: {
