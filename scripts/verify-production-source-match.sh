@@ -74,7 +74,7 @@ while IFS= read -r -d '' path; do
   fi
 done < "$workdir/paths"
 
-printf 'Checked %d tracked paths; excluded .github/** and host-side verifier by Dockerfile copy-set contract.\n' "$checked"
+printf 'Checked %d tracked paths; excluded .github/** and host-side verifier by captured-image copy-set contract.\n' "$checked"
 if (( failures != 0 )); then
   printf '%d production source mismatches or unexpected absences.\n' "$failures" >&2
   exit 1
