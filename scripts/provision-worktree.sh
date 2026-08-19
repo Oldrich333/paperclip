@@ -364,6 +364,7 @@ async function main() {
   };
 
   fs.writeFileSync(configPath, `${JSON.stringify(targetConfig, null, 2)}\n`, { mode: 0o600 });
+  fs.chmodSync(configPath, 0o600);
 
   const inlineMasterKey = nonEmpty(sourceEnvEntries.PAPERCLIP_SECRETS_MASTER_KEY);
   if (inlineMasterKey) {
@@ -413,6 +414,7 @@ async function main() {
   }
 
   fs.writeFileSync(envPath, `${envLines.join("\n")}\n`, { mode: 0o600 });
+  fs.chmodSync(envPath, 0o600);
 }
 
 main().catch((error) => {
@@ -435,6 +437,11 @@ else
     write_fallback_worktree_config
   fi
 fi
+
+# Node's writeFileSync mode option only applies when a file is created. Keep
+# reused or CLI-created worktree credentials private as well.
+[[ -f "$worktree_config_path" ]] && chmod 0600 -- "$worktree_config_path"
+[[ -f "$worktree_env_path" ]] && chmod 0600 -- "$worktree_env_path"
 
 list_base_node_modules_paths() {
   cd "$base_cwd" &&
