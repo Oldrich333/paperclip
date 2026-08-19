@@ -110,31 +110,25 @@ describe("resolveClaudeConfigDir", () => {
 
 describe("resolveSessionClaudeConfigDir", () => {
   it("uses the profile persisted with the session", () => {
-    expect(
-      resolveSessionClaudeConfigDir(
-        { claudeConfigDir: "/profiles/account-b/.claude" },
-        "/profiles/default/.claude",
-      ),
-    ).toBe(path.resolve("/profiles/account-b/.claude"));
+    expect(resolveSessionClaudeConfigDir(
+      { claudeConfigDir: "/profiles/account-b/.claude" },
+      "/profiles/default/.claude",
+    )).toBe(path.resolve("/profiles/account-b/.claude"));
   });
 
   it("keeps old session rows on the default profile", () => {
-    expect(
-      resolveSessionClaudeConfigDir(
-        { claudeConfigDir: null },
-        "/profiles/default/.claude",
-      ),
-    ).toBe("/profiles/default/.claude");
+    expect(resolveSessionClaudeConfigDir(
+      { claudeConfigDir: null },
+      "/profiles/default/.claude",
+    )).toBe("/profiles/default/.claude");
   });
 
   it("lets an explicit maintenance override win", () => {
-    expect(
-      resolveSessionClaudeConfigDir(
-        { claudeConfigDir: "/profiles/account-b/.claude" },
-        "/profiles/default/.claude",
-        "/profiles/recovery/.claude",
-      ),
-    ).toBe(path.resolve("/profiles/recovery/.claude"));
+    expect(resolveSessionClaudeConfigDir(
+      { claudeConfigDir: "/profiles/account-b/.claude" },
+      "/profiles/default/.claude",
+      "/profiles/recovery/.claude",
+    )).toBe(path.resolve("/profiles/recovery/.claude"));
   });
 });
 
