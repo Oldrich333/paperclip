@@ -20,6 +20,7 @@ const mockIssueService = vi.hoisted(() => ({
 }));
 
 vi.mock("../services/index.js", () => ({
+  ISSUE_LIST_MAX_LIMIT: 200,
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
   }),
@@ -117,8 +118,9 @@ async function createApp() {
     })),
     transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
   };
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+  const [{ issueRoutes }, { boardMcpRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+    vi.importActual<typeof import("../routes/board-mcp.js")>("../routes/board-mcp.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
   ]);
   const app = express();
@@ -133,6 +135,7 @@ async function createApp() {
     };
     next();
   });
+  app.use("/api", boardMcpRoutes(routeDb as any));
   app.use("/api", issueRoutes(routeDb as any, {} as any));
   app.use(errorHandler);
   return app;
@@ -211,8 +214,21 @@ describe("issue dependency wakeups in issue routes", () => {
       },
     ]);
 
-    const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "done" });
+    const res = await request(await createApp()).post("/api/board/mcp").send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "paperclip.board.issue.update",
+        arguments: {
+          companyId: "company-1",
+          issueId: "issue-1",
+          patch: { status: "done" },
+        },
+      },
+    });
     expect(res.status).toBe(200);
+    expect(res.body.result.structuredContent.status).toBe("done");
     await vi.waitFor(() => {
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-2",

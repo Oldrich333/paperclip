@@ -1,16 +1,10 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import {
-  createIssueSchema,
-  updateIssueSchema,
-  addIssueCommentSchema,
-} from "@paperclipai/shared";
-import {
   heartbeatService,
-  ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
   logActivity,
@@ -192,6 +186,13 @@ const BOARD_MCP_READ_TOOLS = new Set<BoardMcpToolName>([
   "paperclip.board.issue.get",
   "paperclip.board.issue.list",
 ]);
+const BOARD_MCP_ISSUE_TOOLS = new Set<BoardMcpToolName>([
+  "paperclip.board.issue.get",
+  "paperclip.board.issue.list",
+  "paperclip.board.issue.create",
+  "paperclip.board.issue.update",
+  "paperclip.board.issue.comment",
+]);
 
 type JsonRpcRequest = {
   jsonrpc?: unknown;
@@ -220,6 +221,118 @@ function zodFailure(error: z.ZodError) {
   return new HttpError(422, "Invalid Paperclip Board tool arguments", {
     issues: error.issues,
   });
+}
+
+type ForwardedIssueRequest = {
+  method: "GET" | "POST" | "PATCH";
+  url: string;
+  body: Record<string, unknown>;
+};
+
+function queryString(entries: Array<[string, string | number | null | undefined]>) {
+  const query = new URLSearchParams();
+  for (const [key, value] of entries) {
+    if (value !== undefined && value !== null) query.append(key, String(value));
+  }
+  const encoded = query.toString();
+  return encoded ? `?${encoded}` : "";
+}
+
+function parseForwardedIssueRequest(name: BoardMcpToolName, rawArgs: unknown): ForwardedIssueRequest {
+  switch (name) {
+    case "paperclip.board.issue.get": {
+      const parsed = issueGetArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) throw zodFailure(parsed.error);
+      return {
+        method: "GET",
+        url: `/issues/${encodeURIComponent(parsed.data.issueId)}`,
+        body: {},
+      };
+    }
+    case "paperclip.board.issue.list": {
+      const parsed = issueListArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) throw zodFailure(parsed.error);
+      const status = Array.isArray(parsed.data.status)
+        ? parsed.data.status.join(",")
+        : parsed.data.status;
+      return {
+        method: "GET",
+        url: `/companies/${encodeURIComponent(parsed.data.companyId)}/issues${queryString([
+          ["status", status],
+          ["q", parsed.data.q],
+          ["assigneeAgentId", parsed.data.assigneeAgentId === null ? "null" : parsed.data.assigneeAgentId],
+          ["assigneeUserId", parsed.data.assigneeUserId],
+          ["limit", parsed.data.limit],
+          ["offset", parsed.data.offset],
+        ])}`,
+        body: {},
+      };
+    }
+    case "paperclip.board.issue.create": {
+      if (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs)) {
+        throw new HttpError(422, "Tool arguments must be an object");
+      }
+      const { companyId: _companyId, ...body } = rawArgs as Record<string, unknown>;
+      return {
+        method: "POST",
+        url: `/companies/${encodeURIComponent(String(_companyId).trim())}/issues`,
+        body,
+      };
+    }
+    case "paperclip.board.issue.update": {
+      const parsed = issueUpdateArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) throw zodFailure(parsed.error);
+      return {
+        method: "PATCH",
+        url: `/issues/${encodeURIComponent(parsed.data.issueId)}`,
+        body: parsed.data.patch,
+      };
+    }
+    case "paperclip.board.issue.comment": {
+      const parsed = issueCommentArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) throw zodFailure(parsed.error);
+      return {
+        method: "POST",
+        url: `/issues/${encodeURIComponent(parsed.data.issueId)}/comments`,
+        body: { body: parsed.data.body },
+      };
+    }
+    default:
+      throw new HttpError(404, `Unknown Board issue tool: ${name}`);
+  }
+}
+
+function forwardIssueTool(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  id: unknown,
+  target: ForwardedIssueRequest,
+) {
+  const originalJson = res.json.bind(res);
+  res.json = ((data: unknown) => {
+    const status = res.statusCode;
+    if (status === 401 || status === 403) {
+      return originalJson(jsonRpcError(
+        id,
+        status === 401 ? -32001 : -32003,
+        data && typeof data === "object" && "error" in data
+          ? String((data as { error?: unknown }).error ?? "Request denied")
+          : "Request denied",
+        data,
+      ));
+    }
+    res.status(200);
+    return originalJson({
+      jsonrpc: "2.0",
+      id: id ?? null,
+      result: toolResult(data, status < 200 || status >= 300),
+    });
+  }) as Response["json"];
+  req.method = target.method;
+  req.url = target.url;
+  req.body = target.body;
+  next("router");
 }
 
 async function requireIssue(
@@ -261,7 +374,7 @@ export function boardMcpRoutes(db: Db, options: { pluginWorkerManager?: PluginWo
   const svc = issueService(db);
   const heartbeat = heartbeatService(db, { pluginWorkerManager: options.pluginWorkerManager });
 
-  async function executeTool(req: Request, name: BoardMcpToolName, rawArgs: unknown) {
+  async function authorizeToolCall(req: Request, name: BoardMcpToolName, rawArgs: unknown) {
     assertBoard(req);
     if (!rawArgs || typeof rawArgs !== "object" || Array.isArray(rawArgs)) {
       throw new HttpError(422, "Tool arguments must be an object");
@@ -276,96 +389,23 @@ export function boardMcpRoutes(db: Db, options: { pluginWorkerManager?: PluginWo
       assertCompanyAccess(req, companyId);
     }
     const actor = boardActorId(req);
+    if (
+      name === "paperclip.board.issue.get" ||
+      name === "paperclip.board.issue.update" ||
+      name === "paperclip.board.issue.comment"
+    ) {
+      const issueId = (rawArgs as Record<string, unknown>).issueId;
+      if (typeof issueId === "string" && issueId.trim()) {
+        await requireIssue(req, svc, companyId, issueId);
+      }
+    }
+    return { actor, companyId };
+  }
+
+  async function executeRunTool(req: Request, name: BoardMcpToolName, rawArgs: unknown) {
+    const { actor, companyId } = await authorizeToolCall(req, name, rawArgs);
 
     switch (name) {
-      case "paperclip.board.issue.get": {
-        const parsed = issueGetArgsSchema.safeParse(rawArgs);
-        if (!parsed.success) throw zodFailure(parsed.error);
-        return requireIssue(req, svc, parsed.data.companyId, parsed.data.issueId);
-      }
-      case "paperclip.board.issue.list": {
-        const parsed = issueListArgsSchema.safeParse(rawArgs);
-        if (!parsed.success) throw zodFailure(parsed.error);
-        return svc.list(parsed.data.companyId, {
-          status: parsed.data.status,
-          q: parsed.data.q,
-          assigneeAgentId: parsed.data.assigneeAgentId,
-          assigneeUserId: parsed.data.assigneeUserId,
-          limit: parsed.data.limit ?? ISSUE_LIST_DEFAULT_LIMIT,
-          offset: parsed.data.offset,
-        });
-      }
-      case "paperclip.board.issue.create": {
-        const raw = { ...(rawArgs as Record<string, unknown>) };
-        delete raw.companyId;
-        const parsed = createIssueSchema.safeParse(raw);
-        if (!parsed.success) throw zodFailure(parsed.error);
-        const issue = await svc.create(companyId, {
-          ...parsed.data,
-          createdByUserId: actor.actorId,
-          actorResponsibleUserId: actor.actorId,
-          trustExplicitResponsibleUserId: true,
-        });
-        await logActivity(db, {
-          companyId,
-          actorType: "user",
-          actorId: actor.actorId,
-          action: "board_mcp.issue_created",
-          entityType: "issue",
-          entityId: issue.id,
-          details: { identifier: issue.identifier, title: issue.title, source: "board_mcp" },
-        });
-        return issue;
-      }
-      case "paperclip.board.issue.update": {
-        const parsed = issueUpdateArgsSchema.safeParse(rawArgs);
-        if (!parsed.success) throw zodFailure(parsed.error);
-        const issue = await requireIssue(req, svc, parsed.data.companyId, parsed.data.issueId);
-        const updateInput = updateIssueSchema.safeParse(parsed.data.patch);
-        if (!updateInput.success) throw zodFailure(updateInput.error);
-        const {
-          comment: _comment,
-          reviewRequest: _reviewRequest,
-          reopen: _reopen,
-          resume: _resume,
-          interrupt: _interrupt,
-          watchdogDiscovery: _watchdogDiscovery,
-          ...patch
-        } = updateInput.data;
-        const updated = await svc.update(issue.id, {
-          ...(patch as Parameters<typeof svc.update>[1]),
-          actorUserId: actor.actorId,
-        });
-        if (!updated) throw notFound("Issue not found");
-        await logActivity(db, {
-          companyId,
-          actorType: "user",
-          actorId: actor.actorId,
-          action: "board_mcp.issue_updated",
-          entityType: "issue",
-          entityId: issue.id,
-          details: { identifier: updated.identifier, source: "board_mcp", fields: Object.keys(patch) },
-        });
-        return updated;
-      }
-      case "paperclip.board.issue.comment": {
-        const parsed = issueCommentArgsSchema.safeParse(rawArgs);
-        if (!parsed.success) throw zodFailure(parsed.error);
-        const issue = await requireIssue(req, svc, parsed.data.companyId, parsed.data.issueId);
-        const commentInput = addIssueCommentSchema.safeParse({ body: parsed.data.body });
-        if (!commentInput.success) throw zodFailure(commentInput.error);
-        const comment = await svc.addComment(issue.id, commentInput.data.body, { userId: actor.actorId }, { authorType: "user" });
-        await logActivity(db, {
-          companyId,
-          actorType: "user",
-          actorId: actor.actorId,
-          action: "board_mcp.issue_commented",
-          entityType: "issue",
-          entityId: issue.id,
-          details: { identifier: issue.identifier, commentId: comment.id, source: "board_mcp" },
-        });
-        return comment;
-      }
       case "paperclip.board.run.start":
       case "paperclip.board.run.resume": {
         const parsed = runArgsSchema.safeParse(rawArgs);
@@ -414,17 +454,19 @@ export function boardMcpRoutes(db: Db, options: { pluginWorkerManager?: PluginWo
             ...(isResume ? { resumeIntent: true, followUpRequested: true } : {}),
           },
         });
-        await logActivity(db, {
-          companyId,
-          actorType: "user",
-          actorId: actor.actorId,
-          agentId: issue.assigneeAgentId,
-          runId: run?.id ?? null,
-          action: isResume ? "board_mcp.run_resumed" : "board_mcp.run_started",
-          entityType: "issue",
-          entityId: issue.id,
-          details: { identifier: issue.identifier, runId: run?.id ?? null, resumeFromRunId, source: "board_mcp" },
-        });
+        if (run) {
+          await logActivity(db, {
+            companyId,
+            actorType: "user",
+            actorId: actor.actorId,
+            agentId: issue.assigneeAgentId,
+            runId: run.id,
+            action: isResume ? "board_mcp.run_resumed" : "board_mcp.run_started",
+            entityType: "issue",
+            entityId: issue.id,
+            details: { identifier: issue.identifier, runId: run.id, resumeFromRunId, source: "board_mcp" },
+          });
+        }
         return { issueId: issue.id, agentId: issue.assigneeAgentId, run, resumeFromRunId, status: run ? "queued" : "skipped" };
       }
       default:
@@ -432,7 +474,7 @@ export function boardMcpRoutes(db: Db, options: { pluginWorkerManager?: PluginWo
     }
   }
 
-  async function handleMcp(req: Request, res: Response) {
+  async function handleMcp(req: Request, res: Response, next: NextFunction) {
     const body = (req.body ?? {}) as JsonRpcRequest;
     const id = body.id ?? null;
     try {
@@ -469,7 +511,14 @@ export function boardMcpRoutes(db: Db, options: { pluginWorkerManager?: PluginWo
         res.status(400).json(jsonRpcError(id, -32602, "params.name must name a Board MCP tool"));
         return;
       }
-      const data = await executeTool(req, name, params.arguments ?? {});
+      const args = params.arguments ?? {};
+      if (BOARD_MCP_ISSUE_TOOLS.has(name)) {
+        await authorizeToolCall(req, name, args);
+        const target = parseForwardedIssueRequest(name, args);
+        forwardIssueTool(req, res, next, id, target);
+        return;
+      }
+      const data = await executeRunTool(req, name, args);
       res.json({ jsonrpc: "2.0", id, result: toolResult(data) });
     } catch (error) {
       if (res.headersSent) return;

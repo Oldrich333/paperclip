@@ -401,7 +401,6 @@ export async function createApp(
   // Mount API routes
   const api = Router();
   api.use(boardMutationGuard());
-  api.use(boardMcpRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(
     "/health",
     healthRoutes(db, {
@@ -570,6 +569,10 @@ export async function createApp(
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
+  // Board MCP issue calls are rewritten into these normal issue routes so every
+  // mutation shares the same assignment, status, dependency, mention, reference,
+  // cancellation, and audit lifecycle as the REST/Board surface.
+  api.use(boardMcpRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(issueRoutes(db, opts.storageService, {
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,

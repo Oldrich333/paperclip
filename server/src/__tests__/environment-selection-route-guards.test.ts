@@ -3,6 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { errorHandler } from "../middleware/index.js";
+import { boardMcpRoutes } from "../routes/board-mcp.js";
 import { projectRoutes } from "../routes/projects.js";
 import { issueRoutes } from "../routes/issues.js";
 
@@ -51,8 +52,10 @@ const mockSecretService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockQueueIssueAssignmentWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../services/index.js", () => ({
+  ISSUE_LIST_MAX_LIMIT: 200,
   projectService: () => mockProjectService,
   issueService: () => mockIssueService,
   companyService: () => mockCompanyService,
@@ -107,7 +110,7 @@ vi.mock("../services/secrets.js", () => ({
 }));
 
 vi.mock("../services/issue-assignment-wakeup.js", () => ({
-  queueIssueAssignmentWakeup: vi.fn(),
+  queueIssueAssignmentWakeup: mockQueueIssueAssignmentWakeup,
 }));
 
 function buildApp(routerFactory: (app: express.Express) => void) {
@@ -138,6 +141,7 @@ function createProjectApp() {
 
 function createIssueApp() {
   issueServer ??= buildApp((expressApp) => {
+    expressApp.use("/api", boardMcpRoutes({} as any));
     expressApp.use("/api", issueRoutes({} as any, {} as any));
   }).listen(0);
   return issueServer;
@@ -191,6 +195,7 @@ describe.sequential("execution environment route guards", () => {
     mockIssueReferenceService.syncIssue.mockClear();
     mockSecretService.normalizeEnvBindingsForPersistence.mockClear();
     mockLogActivity.mockReset();
+    mockQueueIssueAssignmentWakeup.mockClear();
   });
 
   it("accepts sandbox environments on project create", async () => {
@@ -274,16 +279,74 @@ describe.sequential("execution environment route guards", () => {
     const app = createIssueApp();
 
     const res = await request(app)
-      .post("/api/companies/company-1/issues")
+      .post("/api/board/mcp")
       .send({
-        title: "Sandboxed Issue",
-        executionWorkspaceSettings: {
-          environmentId: sandboxEnvironmentId,
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "paperclip.board.issue.create",
+          arguments: {
+            companyId: "company-1",
+            title: "Sandboxed Issue",
+            executionWorkspaceSettings: {
+              environmentId: sandboxEnvironmentId,
+            },
+          },
         },
       });
 
-    expect(res.status).not.toBe(422);
+    expect(res.status).toBe(200);
+    expect(res.body.result.structuredContent).toMatchObject({ id: "issue-1", title: "Sandboxed Issue" });
     expect(mockIssueService.create).toHaveBeenCalled();
+    await vi.waitFor(() => expect(mockQueueIssueAssignmentWakeup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issue: expect.objectContaining({ id: "issue-1" }),
+        mutation: "create",
+      }),
+    ));
+  });
+
+  it("preserves issue create deduplication through Board MCP without a false created audit", async () => {
+    mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => {
+      const onDeduplicated = input.onDeduplicated as ((reason: "idempotency_key") => void) | undefined;
+      onDeduplicated?.("idempotency_key");
+      return {
+        id: "issue-existing",
+        companyId: "company-1",
+        title: "Existing issue",
+        status: "todo",
+        identifier: "PAPA-998",
+      };
+    });
+
+    const res = await request(createIssueApp())
+      .post("/api/board/mcp")
+      .send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "paperclip.board.issue.create",
+          arguments: {
+            companyId: "company-1",
+            title: "Existing issue",
+            idempotencyKey: "same-request",
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.result.structuredContent).toMatchObject({
+      id: "issue-existing",
+      deduplicated: true,
+      deduplicationReason: "idempotency_key",
+    });
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.created" }),
+    );
+    expect(mockQueueIssueAssignmentWakeup).not.toHaveBeenCalled();
   });
 
   it("rejects unsupported driver environments on issue create", async () => {

@@ -84,6 +84,19 @@ const mockIssueRecoveryActionService = vi.hoisted(() => ({
 const mockIssueTreeControlService = vi.hoisted(() => ({
   getActivePauseHoldGate: vi.fn(async () => null),
 }));
+const mockIssueReferenceService = vi.hoisted(() => ({
+  deleteDocumentSource: vi.fn(async () => undefined),
+  diffIssueReferenceSummary: vi.fn(() => ({
+    addedReferencedIssues: [],
+    removedReferencedIssues: [],
+    currentReferencedIssues: [],
+  })),
+  emptySummary: vi.fn(() => ({ outbound: [], inbound: [] })),
+  listIssueReferenceSummary: vi.fn(async () => ({ outbound: [], inbound: [] })),
+  syncComment: vi.fn(async () => undefined),
+  syncDocument: vi.fn(async () => undefined),
+  syncIssue: vi.fn(async () => undefined),
+}));
 const mockExternalObjectService = vi.hoisted(() => ({
   syncCommentSafely: vi.fn(async () => undefined),
   syncIssueSafely: vi.fn(async () => undefined),
@@ -134,6 +147,7 @@ vi.mock("../services/routines.js", () => ({
 }));
 
 vi.mock("../services/index.js", () => ({
+  ISSUE_LIST_MAX_LIMIT: 200,
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
   }),
@@ -151,19 +165,7 @@ vi.mock("../services/index.js", () => ({
   instanceSettingsService: () => mockInstanceSettingsService,
   issueApprovalService: () => ({}),
   issueRecoveryActionService: () => mockIssueRecoveryActionService,
-  issueReferenceService: () => ({
-    deleteDocumentSource: async () => undefined,
-    diffIssueReferenceSummary: () => ({
-      addedReferencedIssues: [],
-      removedReferencedIssues: [],
-      currentReferencedIssues: [],
-    }),
-    emptySummary: () => ({ outbound: [], inbound: [] }),
-    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-    syncComment: async () => undefined,
-    syncDocument: async () => undefined,
-    syncIssue: async () => undefined,
-  }),
+  issueReferenceService: () => mockIssueReferenceService,
   issueService: () => mockIssueService,
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   issueTreeControlService: () => mockIssueTreeControlService,
@@ -190,8 +192,9 @@ function createApp() {
 }
 
 async function installActor(app: express.Express, actor?: Record<string, unknown>) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+  const [{ issueRoutes }, { boardMcpRoutes }, { errorHandler }] = await Promise.all([
     import("../routes/issues.js"),
+    import("../routes/board-mcp.js"),
     import("../middleware/index.js"),
   ]);
   app.use((req, _res, next) => {
@@ -204,6 +207,7 @@ async function installActor(app: express.Express, actor?: Record<string, unknown
     };
     next();
   });
+  app.use("/api", boardMcpRoutes(mockDb as any));
   app.use("/api", issueRoutes(mockDb as any, {} as any));
   app.use(errorHandler);
   return app;
@@ -361,6 +365,13 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
     mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue(null);
+    mockIssueReferenceService.deleteDocumentSource.mockClear();
+    mockIssueReferenceService.diffIssueReferenceSummary.mockClear();
+    mockIssueReferenceService.emptySummary.mockClear();
+    mockIssueReferenceService.listIssueReferenceSummary.mockClear();
+    mockIssueReferenceService.syncComment.mockClear();
+    mockIssueReferenceService.syncDocument.mockClear();
+    mockIssueReferenceService.syncIssue.mockClear();
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-1",
       issueId: "11111111-1111-4111-8111-111111111111",
@@ -1110,6 +1121,53 @@ describe.sequential("issue comment reopen routes", () => {
     await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       "22222222-2222-4222-8222-222222222222",
       expect.objectContaining({ reason: "issue_commented" }),
+    ));
+  });
+
+  it("runs Board MCP comments through reference sync and mention wakeups", async () => {
+    const app = await installActor(createApp());
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-board-mcp",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "@reviewer please check this",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue(["agent-mentioned"]);
+
+    const res = await request(app)
+      .post("/api/board/mcp")
+      .send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "paperclip.board.issue.comment",
+          arguments: {
+            companyId: "company-1",
+            issueId: "11111111-1111-4111-8111-111111111111",
+            body: "@reviewer please check this",
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.result.structuredContent).toMatchObject({
+      id: "comment-board-mcp",
+      body: "@reviewer please check this",
+    });
+    expect(mockIssueReferenceService.syncComment).toHaveBeenCalledWith("comment-board-mcp");
+    expect(mockExternalObjectService.syncCommentSafely).toHaveBeenCalledWith("comment-board-mcp");
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "agent-mentioned",
+      expect.objectContaining({
+        reason: "issue_comment_mentioned",
+        payload: expect.objectContaining({ commentId: "comment-board-mcp" }),
+      }),
     ));
   });
 
@@ -2351,10 +2409,23 @@ describe.sequential("issue comment reopen routes", () => {
     });
 
     const res = await request(await installActor(createApp()))
-      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ status: "cancelled" });
+      .post("/api/board/mcp")
+      .send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "paperclip.board.issue.update",
+          arguments: {
+            companyId: "company-1",
+            issueId: "11111111-1111-4111-8111-111111111111",
+            patch: { status: "cancelled" },
+          },
+        },
+      });
 
     expect(res.status).toBe(200);
+    expect(res.body.result.structuredContent.status).toBe("cancelled");
     expect(mockHeartbeatService.getRun).toHaveBeenCalledWith("run-1");
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1");
     expect(mockLogActivity).toHaveBeenCalledWith(
