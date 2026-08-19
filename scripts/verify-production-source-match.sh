@@ -61,8 +61,27 @@ while IFS= read -r -d '' path; do
   checked=$((checked + 1))
   commit_file="$workdir/commit/$path"
   container_file="$workdir/container/$path"
-  if [[ ! -e "$container_file" ]]; then
+  if [[ ! -e "$container_file" && ! -L "$container_file" ]]; then
     printf 'MISSING %s\n' "$path" >&2
+    failures=$((failures + 1))
+    continue
+  fi
+  if [[ -L "$commit_file" ]]; then
+    if [[ ! -L "$container_file" ]]; then
+      printf 'TYPE-MISMATCH %s expected=symlink actual=not-symlink\n' "$path" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+    commit_target="$(readlink "$commit_file")"
+    container_target="$(readlink "$container_file")"
+    if [[ "$commit_target" != "$container_target" ]]; then
+      printf 'MISMATCH %s commit_target=%s container_target=%s\n' "$path" "$commit_target" "$container_target" >&2
+      failures=$((failures + 1))
+    fi
+    continue
+  fi
+  if [[ ! -f "$commit_file" || ! -f "$container_file" ]]; then
+    printf 'TYPE-MISMATCH %s expected=regular-file\n' "$path" >&2
     failures=$((failures + 1))
     continue
   fi
