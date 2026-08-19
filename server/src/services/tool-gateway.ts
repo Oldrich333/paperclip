@@ -65,6 +65,7 @@ import {
   type ToolRuntimeSupervisorOptions,
   type ToolRuntimeSlotView,
 } from "./tool-runtime-supervisor.js";
+import { updateRemoteConnectionHealth } from "./tool-connection-health.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
 import {
   canonicalToolArguments,
@@ -106,6 +107,8 @@ const TOOL_EXECUTION_LOST_ERROR_MESSAGE =
 const TOOL_EXECUTION_RECONCILIATION_NEXT_ACTION =
   "Read the provider receipt or downstream state before retrying with a new idempotency key.";
 const TOOL_RECONCILIATION_RECEIPT_STATES = new Set(["applied", "not_applied", "pending", "unknown"]);
+const REMOTE_HEALTH_REPROBE_TIMEOUT_MS = 5_000;
+const REMOTE_HEALTH_REPROBE_COOLDOWN_MS = 30_000;
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -920,6 +923,8 @@ export function createToolGatewayService(
   const policyService = toolAccessPolicyService(db);
   const secrets = secretService(db);
   const protocolLimits = mcpGatewayProtocolLimits(options.mcpGatewayProtocolLimits);
+  const healthReprobeInFlight = new Map<string, Promise<void>>();
+  const healthReprobeLastAttempt = new Map<string, number>();
   let nextProtocolRateLimitPruneAt = 0;
 
   async function recordToolInvocation(input: ToolAccessDecisionInput, accessDecision: ToolAccessDecision) {
@@ -1029,7 +1034,7 @@ export function createToolGatewayService(
         inArray(toolConnections.transport, ["mcp_remote", "local_stdio"]),
         eq(toolConnections.status, "active"),
         eq(toolConnections.enabled, true),
-        inArray(toolConnections.healthStatus, ["ok", "healthy"]),
+        inArray(toolConnections.healthStatus, ["ok", "healthy", "degraded"]),
         eq(toolApplications.companyId, companyId),
         inArray(toolApplications.type, ["mcp_http", "mcp_stdio"]),
         eq(toolApplications.status, "active"),
@@ -2160,6 +2165,7 @@ export function createToolGatewayService(
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
+    await reprobeErroredRemoteConnections(session.companyId);
     const allConnectedTools = await connectedMcpToolsForCompany(session.companyId);
     const onDemandTargets = allConnectedTools.filter(isOnDemandRemoteTool);
     const tools = [...allTools(), ...allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool))].filter(
@@ -2583,19 +2589,96 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect,
     status: "ok" | "error" | "missing_secret",
     message: string | null,
+    options: { countFailure?: boolean } = {},
   ) {
-    const now = new Date();
-    await db
-      .update(toolConnections)
-      .set({
-        healthStatus: status,
-        healthMessage: message,
-        healthCheckedAt: now,
-        lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
-        updatedAt: now,
-      })
-      .where(eq(toolConnections.id, connection.id));
+    await updateRemoteConnectionHealth(db, connection, status, message, options);
+  }
+
+  async function reprobeErroredRemoteConnection(connection: typeof toolConnections.$inferSelect): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const credentialHeaders = await resolveCredentialHeaders(connection);
+      const endpoint = await assertRemoteEndpointAllowed(connection.config);
+      const probeSession: ToolGatewaySession = {
+        id: `health-reprobe:${connection.id}`,
+        token: "",
+        companyId: connection.companyId,
+        agentId: null,
+        runId: null,
+        issueId: null,
+        projectId: null,
+        actorType: "system",
+        actorId: "tool-gateway-health-reprobe",
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + REMOTE_HEALTH_REPROBE_TIMEOUT_MS),
+      };
+      const { headers } = buildRemoteHeaders({
+        session: probeSession,
+        connection,
+        credentialHeaders,
+      });
+      const controller = new AbortController();
+      timer = setTimeout(() => controller.abort(), REMOTE_HEALTH_REPROBE_TIMEOUT_MS);
+      timer.unref?.();
+      const response = await fetch(endpoint, {
+        method: "POST",
+        redirect: "manual",
+        headers: mcpHttpRequestHeaders(headers),
+        signal: controller.signal,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: `paperclip-health-reprobe-${randomUUID()}`,
+          method: "tools/list",
+          params: {},
+        }),
+      });
+      const body = await readBoundedRemoteResponse(response);
+      if (!response.ok) throw new Error(`Remote MCP server returned HTTP ${response.status}.`);
+      const payload = asRecord(parseMcpHttpResponseBody(body, response.headers.get("content-type")));
+      const result = asRecord(payload?.result);
+      const discoveredTools = result?.tools ?? payload?.tools;
+      if (!Array.isArray(discoveredTools)) throw new Error("Remote MCP server returned an invalid tools/list response.");
+      await markRemoteConnectionHealth(connection, "ok", "Remote MCP server recovered during discovery re-probe.");
+    } catch (error) {
+      if (error instanceof ToolGatewayHttpError) return;
+      const message = error instanceof Error && error.name === "AbortError"
+        ? "Remote MCP health re-probe timed out."
+        : error instanceof Error
+          ? error.message
+          : "Remote MCP health re-probe failed.";
+      await markRemoteConnectionHealth(connection, "error", message, { countFailure: false });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function reprobeErroredRemoteConnections(companyId: string): Promise<void> {
+    const connections = await db
+      .select()
+      .from(toolConnections)
+      .where(and(
+        eq(toolConnections.companyId, companyId),
+        eq(toolConnections.transport, "mcp_remote"),
+        eq(toolConnections.status, "active"),
+        eq(toolConnections.enabled, true),
+        eq(toolConnections.healthStatus, "error"),
+      ));
+    await Promise.all(connections.map(async (connection) => {
+      if (!connection.lastHealthAt) return;
+      const existing = healthReprobeInFlight.get(connection.id);
+      if (existing) {
+        await existing;
+        return;
+      }
+      const lastAttempt = healthReprobeLastAttempt.get(connection.id) ?? 0;
+      if (Date.now() - lastAttempt < REMOTE_HEALTH_REPROBE_COOLDOWN_MS) return;
+      healthReprobeLastAttempt.set(connection.id, Date.now());
+      const attempt = reprobeErroredRemoteConnection(connection).finally(() => {
+        healthReprobeInFlight.delete(connection.id);
+      });
+      healthReprobeInFlight.set(connection.id, attempt);
+      await attempt;
+    }));
   }
 
   async function resolveCredentialHeaders(connection: typeof toolConnections.$inferSelect): Promise<Record<string, string>> {

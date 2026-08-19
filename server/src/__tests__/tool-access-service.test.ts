@@ -48,6 +48,7 @@ import { canonicalToolArguments, signToolArguments } from "../services/tool-cont
 import { createToolGatewayService, type ToolGatewayService } from "../services/tool-gateway.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
+import { HttpError } from "../errors.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3591,6 +3592,47 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(JSON.stringify(audit)).not.toContain("access-without-refresh");
   });
 
+  it("softens transient remote health-check failures before demoting the connection", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connection = await service.createConnection(company.id, {
+      name: "Transient health fixture",
+      transport: "mcp_remote",
+      config: { url: "https://transient-health.example/mcp" },
+      enabled: true,
+      status: "active",
+    });
+    let failHealthChecks = true;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      if (failHealthChecks) {
+        return {
+          ok: false,
+          status: 503,
+          headers: { get: () => null },
+        } as unknown as Response;
+      }
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: "paperclip-catalog-refresh",
+        result: { tools: [] },
+      });
+    });
+    try {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        await expect(service.checkHealth(connection.id)).rejects.toMatchObject({ status: 502 });
+        const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+        expect(updated?.healthStatus).toBe(attempt === 3 ? "error" : "degraded");
+      }
+
+      failHealthChecks = false;
+      await expect(service.checkHealth(connection.id)).resolves.toMatchObject({
+        connection: { healthStatus: "ok" },
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("returns a callback error when the provider rejects sign-in", async () => {
     const company = await createCompany(db);
     const app = createRouteApp(db, boardSessionActor(company.id, "operator", "operator-user"));
@@ -6351,7 +6393,7 @@ describeEmbeddedPostgres("tool access service", () => {
   it("sweeps enabled active connection health and records failing connections", async () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);
-    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("revoked token"));
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new HttpError(401, "revoked token"));
     const connection = await service.createConnection(company.id, {
       name: "Swept remote",
       transport: "mcp_remote",
@@ -6373,6 +6415,28 @@ describeEmbeddedPostgres("tool access service", () => {
       healthStatus: "error",
       healthMessage: "revoked token",
       lastError: "revoked token",
+    });
+  });
+
+  it("keeps a transient sweep failure degraded on the first strike", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("temporary timeout"));
+    const connection = await service.createConnection(company.id, {
+      name: "Swept transient remote",
+      transport: "mcp_remote",
+      config: { url: "https://fixture.example/mcp" },
+      enabled: true,
+      status: "active",
+    });
+
+    await service.sweepConnectionHealth({ staleAfterMs: 0 });
+    const [updatedConnection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+
+    expect(updatedConnection).toMatchObject({
+      healthStatus: "degraded",
+      healthMessage: "temporary timeout (1/3 consecutive failures; tools remain available.)",
+      lastError: "temporary timeout",
     });
   });
 
