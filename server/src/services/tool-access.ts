@@ -116,6 +116,7 @@ import { secretService } from "./secrets.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { readSignedToolArgumentsPayload } from "./tool-content-guards.js";
 import { effectiveScopeBindings, narrowestScopeBindings, profileIdsInBindingOrder } from "./tool-profile-binding-precedence.js";
+import { updateRemoteConnectionHealth } from "./tool-connection-health.js";
 import { recordToolRuntimeAuditWriteFailure, TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC } from "./tool-runtime-metrics.js";
 import { createToolRuntimeSupervisor, ToolRuntimeSupervisorError } from "./tool-runtime-supervisor.js";
 
@@ -1269,6 +1270,15 @@ function sanitizeHttpFailure(error: unknown): { status: ToolConnectionHealthStat
     return { status: "error", message: error.message.slice(0, 240), code: "runtime_error" };
   }
   return { status: "error", message: "Connection check failed.", code: "runtime_error" };
+}
+
+function isTransientRemoteHealthFailure(error: unknown): boolean {
+  if (!(error instanceof HttpError)) return true;
+  const details = asRecord(error.details);
+  const code = details.code;
+  if (code === "oauth_challenge" || code === "oauth_refresh_missing") return false;
+  const upstreamStatus = typeof details.status === "number" ? details.status : null;
+  return upstreamStatus !== null ? upstreamStatus >= 500 : error.status >= 500;
 }
 
 function remoteEndpoint(config: Record<string, unknown>): string {
@@ -2943,20 +2953,24 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     connection: typeof toolConnections.$inferSelect,
     status: ToolConnectionHealthStatus,
     message: string | null,
+    options: { countFailure?: boolean } = {},
   ) {
     const now = new Date();
-    const [updated] = await db
-      .update(toolConnections)
-      .set({
-        healthStatus: status,
-        healthMessage: message,
-        healthCheckedAt: now,
-        lastHealthAt: now,
-        lastError: status === "ok" ? null : message,
-        updatedAt: now,
-      })
-      .where(eq(toolConnections.id, connection.id))
-      .returning();
+    const updated = connection.transport === "mcp_remote"
+      && (status === "ok" || status === "error" || status === "missing_secret")
+      ? await updateRemoteConnectionHealth(db, connection, status, message, options)
+      : (await db
+        .update(toolConnections)
+        .set({
+          healthStatus: status,
+          healthMessage: message,
+          healthCheckedAt: now,
+          lastHealthAt: now,
+          lastError: status === "ok" ? null : message,
+          updatedAt: now,
+        })
+        .where(eq(toolConnections.id, connection.id))
+        .returning())[0];
     if (connection.transport === "local_stdio") {
       await db
         .update(toolRuntimeSlots)
@@ -2990,7 +3004,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       return { connection: toConnection(updated), runtimeSlot };
     } catch (error) {
       const failure = sanitizeHttpFailure(error);
-      const updated = await updateConnectionHealth(connection, failure.status, failure.message);
+      const updated = await updateConnectionHealth(connection, failure.status, failure.message, {
+        countFailure: connection.transport === "mcp_remote" && isTransientRemoteHealthFailure(error),
+      });
       const runtimeSlot = connection.transport === "local_stdio" ? await ensureRuntimeSlot(updated) : null;
       await audit({
         companyId: connection.companyId,
@@ -3019,7 +3035,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       descriptors = await discoverTools(connection);
     } catch (error) {
       const failure = sanitizeHttpFailure(error);
-      const updated = await updateConnectionHealth(connection, failure.status, failure.message);
+      const updated = await updateConnectionHealth(connection, failure.status, failure.message, {
+        countFailure: connection.transport === "mcp_remote" && isTransientRemoteHealthFailure(error),
+      });
       await audit({
         companyId: connection.companyId,
         connectionId: connection.id,

@@ -3591,6 +3591,47 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(JSON.stringify(audit)).not.toContain("access-without-refresh");
   });
 
+  it("softens transient remote health-check failures before demoting the connection", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connection = await service.createConnection(company.id, {
+      name: "Transient health fixture",
+      transport: "mcp_remote",
+      config: { url: "https://transient-health.example/mcp" },
+      enabled: true,
+      status: "active",
+    });
+    let failHealthChecks = true;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      if (failHealthChecks) {
+        return {
+          ok: false,
+          status: 503,
+          headers: { get: () => null },
+        } as unknown as Response;
+      }
+      return mcpHttpResponse({
+        jsonrpc: "2.0",
+        id: "paperclip-catalog-refresh",
+        result: { tools: [] },
+      });
+    });
+    try {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        await expect(service.checkHealth(connection.id)).rejects.toMatchObject({ status: 502 });
+        const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+        expect(updated?.healthStatus).toBe(attempt === 3 ? "error" : "degraded");
+      }
+
+      failHealthChecks = false;
+      await expect(service.checkHealth(connection.id)).resolves.toMatchObject({
+        connection: { healthStatus: "ok" },
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("returns a callback error when the provider rejects sign-in", async () => {
     const company = await createCompany(db);
     const app = createRouteApp(db, boardSessionActor(company.id, "operator", "operator-user"));
@@ -6370,8 +6411,8 @@ describeEmbeddedPostgres("tool access service", () => {
       failedConnectionIds: [connection.id],
     });
     expect(updatedConnection).toMatchObject({
-      healthStatus: "error",
-      healthMessage: "revoked token",
+      healthStatus: "degraded",
+      healthMessage: "revoked token (1/3 consecutive failures; tools remain available.)",
       lastError: "revoked token",
     });
   });
