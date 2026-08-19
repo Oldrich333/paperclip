@@ -3,16 +3,18 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  accessDecide: vi.fn(),
   issueGetById: vi.fn(),
   getRun: vi.fn(),
-  wakeup: vi.fn(),
+  wakeupWithReceipt: vi.fn(),
   logActivity: vi.fn(),
 }));
 
 vi.mock("../services/index.js", () => ({
+  accessService: () => ({ decide: mocks.accessDecide }),
   heartbeatService: () => ({
     getRun: mocks.getRun,
-    wakeup: mocks.wakeup,
+    wakeupWithReceipt: mocks.wakeupWithReceipt,
   }),
   ISSUE_LIST_MAX_LIMIT: 200,
   issueService: () => ({ getById: mocks.issueGetById }),
@@ -99,9 +101,14 @@ async function callTool(app: express.Express, name: string, args: Record<string,
 describe("Board MCP route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.accessDecide.mockResolvedValue({ allowed: true });
     mocks.issueGetById.mockResolvedValue(issue());
     mocks.getRun.mockResolvedValue(null);
-    mocks.wakeup.mockResolvedValue({ id: "run-1" });
+    mocks.wakeupWithReceipt.mockResolvedValue({
+      run: { id: "run-1", status: "queued" },
+      request: { id: "wake-1", status: "queued", runId: "run-1", coalescedCount: 0 },
+      idempotencyKey: "receipt-1",
+    });
     mocks.logActivity.mockResolvedValue(undefined);
   });
 
@@ -229,7 +236,11 @@ describe("Board MCP route", () => {
       agentId: "agent-1",
       contextSnapshot: { issueId: "issue-1" },
     });
-    mocks.wakeup.mockResolvedValue(null);
+    mocks.wakeupWithReceipt.mockResolvedValue({
+      run: null,
+      request: { id: "wake-skipped", status: "skipped", runId: null, coalescedCount: 0 },
+      idempotencyKey: "receipt-skipped",
+    });
 
     const response = await callTool(createApp(boardActor()), toolName, {
       companyId,
@@ -243,25 +254,89 @@ describe("Board MCP route", () => {
       agentId: "agent-1",
       run: null,
       status: "skipped",
+      outcome: "skipped",
     });
     expect(mocks.logActivity).not.toHaveBeenCalled();
   });
 
-  it("audits a started run only when wakeup returns a durable run", async () => {
+  it("audits a newly created durable run using its actual queued status", async () => {
     const response = await callTool(createApp(boardActor()), "paperclip.board.run.start", {
       companyId,
       issueId: "issue-1",
     });
 
     expect(response.status).toBe(200);
-    expect(response.body.result.structuredContent.status).toBe("queued");
+    expect(response.body.result.structuredContent).toMatchObject({
+      status: "queued",
+      outcome: "created",
+      runStatus: "queued",
+    });
     expect(mocks.logActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
-        action: "board_mcp.run_started",
+        action: "board_mcp.run_created",
         runId: "run-1",
         entityId: "issue-1",
       }),
+    );
+  });
+
+  it.each([
+    "paperclip.board.run.start",
+    "paperclip.board.run.resume",
+  ])("requires agents:create permission before %s can wake an assigned agent", async (toolName) => {
+    mocks.accessDecide.mockResolvedValue({
+      allowed: false,
+      explanation: "Missing agents:create permission",
+      requiredPermissions: ["agents:create"],
+    });
+
+    const response = await callTool(createApp(boardActor()), toolName, {
+      companyId,
+      issueId: "issue-1",
+    });
+
+    expect(response.status).toBe(403);
+    expect(response.body.error.message).toContain("agents:create");
+    expect(mocks.wakeupWithReceipt).not.toHaveBeenCalled();
+    expect(mocks.logActivity).not.toHaveBeenCalled();
+  });
+
+  it("reports and audits a coalesced running wake without claiming a new run", async () => {
+    mocks.wakeupWithReceipt.mockResolvedValue({
+      run: { id: "run-existing", status: "running" },
+      request: { id: "wake-coalesced", status: "coalesced", runId: "run-existing", coalescedCount: 1 },
+      idempotencyKey: "receipt-coalesced",
+    });
+
+    const response = await callTool(createApp(boardActor()), "paperclip.board.run.start", {
+      companyId,
+      issueId: "issue-1",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.result.structuredContent).toMatchObject({
+      outcome: "coalesced",
+      status: "coalesced",
+      runStatus: "running",
+      run: { id: "run-existing", status: "running" },
+      wakeupRequest: { id: "wake-coalesced", status: "coalesced" },
+    });
+    expect(mocks.logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "board_mcp.run_coalesced",
+        runId: "run-existing",
+        details: expect.objectContaining({
+          requestedAction: "start",
+          wakeupRequestStatus: "coalesced",
+          runStatus: "running",
+        }),
+      }),
+    );
+    expect(mocks.logActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "board_mcp.run_created" }),
     );
   });
 });

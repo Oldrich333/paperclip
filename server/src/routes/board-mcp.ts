@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import {
+  accessService,
   heartbeatService,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
@@ -12,6 +13,7 @@ import {
 import { HttpError, notFound, unprocessable } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoardCanManageAgentsForCompany } from "./agent-management-authz.js";
 
 /**
  * Board-scoped Paperclip control-plane tools.
@@ -388,6 +390,7 @@ export function boardMcpRoutes(
 ) {
   const router = Router();
   const svc = issueService(db);
+  const access = accessService(db);
   const heartbeat = heartbeatService(db, { pluginWorkerManager: options.pluginWorkerManager });
 
   async function authorizeToolCall(req: Request, name: BoardMcpToolName, rawArgs: unknown) {
@@ -430,6 +433,7 @@ export function boardMcpRoutes(
         if (!issue.assigneeAgentId) {
           throw unprocessable("Issue has no assigned agent to start or resume");
         }
+        await assertBoardCanManageAgentsForCompany(req, companyId, access);
 
         let resumeFromRunId: string | null = null;
         if (name.endsWith("resume")) {
@@ -451,7 +455,7 @@ export function boardMcpRoutes(
         }
 
         const isResume = name.endsWith("resume");
-        const run = await heartbeat.wakeup(issue.assigneeAgentId, {
+        const wakeup = await heartbeat.wakeupWithReceipt(issue.assigneeAgentId, {
           source: "on_demand",
           triggerDetail: "manual",
           reason: isResume ? "board_issue_resume" : "board_issue_start",
@@ -470,20 +474,49 @@ export function boardMcpRoutes(
             ...(isResume ? { resumeIntent: true, followUpRequested: true } : {}),
           },
         });
-        if (run) {
+        const { run, request: wakeupRequest } = wakeup;
+        const coalesced = wakeupRequest?.status === "coalesced";
+        const created = Boolean(
+          run &&
+          wakeupRequest &&
+          !coalesced &&
+          wakeupRequest.runId === run.id,
+        );
+        if (run && (created || coalesced)) {
           await logActivity(db, {
             companyId,
             actorType: "user",
             actorId: actor.actorId,
             agentId: issue.assigneeAgentId,
             runId: run.id,
-            action: isResume ? "board_mcp.run_resumed" : "board_mcp.run_started",
+            action: coalesced
+              ? "board_mcp.run_coalesced"
+              : "board_mcp.run_created",
             entityType: "issue",
             entityId: issue.id,
-            details: { identifier: issue.identifier, runId: run.id, resumeFromRunId, source: "board_mcp" },
+            details: {
+              identifier: issue.identifier,
+              runId: run.id,
+              resumeFromRunId,
+              source: "board_mcp",
+              requestedAction: isResume ? "resume" : "start",
+              wakeupRequestId: wakeupRequest?.id ?? null,
+              wakeupRequestStatus: wakeupRequest?.status ?? null,
+              runStatus: run.status,
+            },
           });
         }
-        return { issueId: issue.id, agentId: issue.assigneeAgentId, run, resumeFromRunId, status: run ? "queued" : "skipped" };
+        const outcome = coalesced ? "coalesced" : created ? "created" : run ? "unknown" : "skipped";
+        return {
+          issueId: issue.id,
+          agentId: issue.assigneeAgentId,
+          run,
+          resumeFromRunId,
+          outcome,
+          status: coalesced ? "coalesced" : run?.status ?? wakeupRequest?.status ?? "skipped",
+          runStatus: run?.status ?? null,
+          wakeupRequest,
+        };
       }
       default:
         throw new HttpError(404, `Unknown Board tool: ${name}`);

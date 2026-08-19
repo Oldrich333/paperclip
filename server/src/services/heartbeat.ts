@@ -19344,6 +19344,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
 
     wakeup: trackWakeup,
+    wakeupWithReceipt: async (agentId: string, opts: WakeupOptions = {}) => {
+      const idempotencyKey = opts.idempotencyKey?.trim() || `wakeup_receipt:${randomUUID()}`;
+      const run = await trackWakeup(agentId, { ...opts, idempotencyKey });
+      const request = await db
+        .select({
+          id: agentWakeupRequests.id,
+          status: agentWakeupRequests.status,
+          runId: agentWakeupRequests.runId,
+          coalescedCount: agentWakeupRequests.coalescedCount,
+        })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ))
+        .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      return { run, request, idempotencyKey };
+    },
     triggerIssueMonitor,
 
     reportRunActivity: clearDetachedRunWarning,

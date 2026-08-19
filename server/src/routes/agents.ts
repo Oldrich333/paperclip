@@ -61,6 +61,7 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoardCanManageAgentsForCompany } from "./agent-management-authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -1125,18 +1126,6 @@ export function agentRoutes(
     return actorAgent;
   }
 
-  async function assertBoardCanManageAgentsForCompany(req: Request, companyId: string) {
-    assertBoard(req);
-    assertCompanyAccess(req, companyId);
-    const decision = await access.decide({
-      actor: req.actor,
-      action: "agents:create",
-      resource: { type: "company", companyId },
-    });
-    if (decision.allowed) return;
-    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
-  }
-
   // The single owner-authorization helper for the three adapter login routes. It
   // requires a board actor, company access, and the same configuration
   // permission as the adapter Test route (`agents:create`). It returns the
@@ -1295,7 +1284,7 @@ export function agentRoutes(
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return null;
     if (req.actor.type === "board") {
-      await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+      await assertBoardCanManageAgentsForCompany(req, agent.companyId, access);
     }
     return agent;
   }
@@ -3065,7 +3054,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+    await assertBoardCanManageAgentsForCompany(req, agent.companyId, access);
 
     const state = await heartbeat.getRuntimeState(id);
     res.json(state);
@@ -3076,7 +3065,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+    await assertBoardCanManageAgentsForCompany(req, agent.companyId, access);
 
     const sessions = await heartbeat.listTaskSessions(id);
     res.json(
@@ -3092,7 +3081,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+    await assertBoardCanManageAgentsForCompany(req, agent.companyId, access);
 
     const taskKey =
       typeof req.body.taskKey === "string" && req.body.taskKey.trim().length > 0
@@ -3474,7 +3463,7 @@ export function agentRoutes(
         return;
       }
     } else {
-      await assertBoardCanManageAgentsForCompany(req, existing.companyId);
+      await assertBoardCanManageAgentsForCompany(req, existing.companyId, access);
     }
 
     const agent = await svc.updatePermissions(id, req.body);
@@ -4258,7 +4247,7 @@ export function agentRoutes(
         return;
       }
     } else {
-      await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+      await assertBoardCanManageAgentsForCompany(req, agent.companyId, access);
     }
     if (agent.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
@@ -4328,7 +4317,7 @@ export function agentRoutes(
         return;
       }
     } else {
-      await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+      await assertBoardCanManageAgentsForCompany(req, agent.companyId, access);
     }
     if (agent.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
@@ -4395,7 +4384,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
-    await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+    await assertBoardCanManageAgentsForCompany(req, agent.companyId, access);
     if (agent.adapterType !== "claude_local") {
       res.status(400).json({ error: "Login is only supported for claude_local agents" });
       return;
