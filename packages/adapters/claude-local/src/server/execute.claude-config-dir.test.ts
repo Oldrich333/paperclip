@@ -126,6 +126,25 @@ describe("claude_local subscription profile isolation", () => {
     );
   });
 
+  it("resolves a relative local profile from the Claude process working directory", async () => {
+    const workspaceDir = "/var/tmp/paperclip-agent-workspace";
+    const relativeDir = "../claude-profiles/account-b/.claude";
+    const expectedDir = "/var/tmp/claude-profiles/account-b/.claude";
+
+    const result = await execute(buildContext({
+      config: {
+        cwd: workspaceDir,
+        env: { CLAUDE_CONFIG_DIR: relativeDir },
+      },
+    }) as never);
+    const { options } = invocation();
+
+    expect(options.env.CLAUDE_CONFIG_DIR).toBe(expectedDir);
+    expect(result.sessionParams).toEqual(
+      expect.objectContaining({ claudeConfigDir: expectedDir }),
+    );
+  });
+
   it("starts a fresh session when an agent is moved to another subscription profile", async () => {
     const previousDir = "/var/tmp/paperclip-claude-account-a/.claude";
     const selectedDir = "/var/tmp/paperclip-claude-account-b/.claude";
