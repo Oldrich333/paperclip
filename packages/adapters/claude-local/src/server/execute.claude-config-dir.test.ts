@@ -53,7 +53,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { execute } from "./execute.js";
+import { execute, runClaudeLogin } from "./execute.js";
 
 function buildContext(input: {
   config?: Record<string, unknown>;
@@ -144,6 +144,25 @@ describe("claude_local subscription profile isolation", () => {
     expect(result.sessionParams).toEqual(
       expect.objectContaining({ claudeConfigDir: expectedDir }),
     );
+  });
+
+  it("uses the same normalized relative profile for Claude login", async () => {
+    const workspaceDir = "/var/tmp/paperclip-agent-workspace";
+    const relativeDir = "../claude-profiles/account-b/.claude";
+    const expectedDir = path.resolve(relativeDir);
+
+    await runClaudeLogin({
+      runId: "login-1",
+      agent: buildContext().agent,
+      config: {
+        cwd: workspaceDir,
+        env: { CLAUDE_CONFIG_DIR: relativeDir },
+      },
+    } as never);
+    const { args, options } = invocation();
+
+    expect(args).toEqual(["login"]);
+    expect(options.env.CLAUDE_CONFIG_DIR).toBe(expectedDir);
   });
 
   it("starts a fresh session when an agent is moved to another subscription profile", async () => {
