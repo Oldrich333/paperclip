@@ -207,8 +207,9 @@ async function installActor(app: express.Express, actor?: Record<string, unknown
     };
     next();
   });
-  app.use("/api", boardMcpRoutes(mockDb as any));
-  app.use("/api", issueRoutes(mockDb as any, {} as any));
+  const issueRouter = issueRoutes(mockDb as any, {} as any);
+  app.use("/api", boardMcpRoutes(mockDb as any, { issueRouter }));
+  app.use("/api", issueRouter);
   app.use(errorHandler);
   return app;
 }

@@ -135,8 +135,9 @@ async function createApp() {
     };
     next();
   });
-  app.use("/api", boardMcpRoutes(routeDb as any));
-  app.use("/api", issueRoutes(routeDb as any, {} as any));
+  const issueRouter = issueRoutes(routeDb as any, {} as any);
+  app.use("/api", boardMcpRoutes(routeDb as any, { issueRouter }));
+  app.use("/api", issueRouter);
   app.use(errorHandler);
   return app;
 }

@@ -228,6 +228,7 @@ type ForwardedIssueRequest = {
   url: string;
   body: Record<string, unknown>;
 };
+type IssueLifecycleRouter = ReturnType<typeof Router>;
 
 function queryString(entries: Array<[string, string | number | null | undefined]>) {
   const query = new URLSearchParams();
@@ -308,6 +309,7 @@ function forwardIssueTool(
   next: NextFunction,
   id: unknown,
   target: ForwardedIssueRequest,
+  issueRouter: IssueLifecycleRouter,
 ) {
   const originalJson = res.json.bind(res);
   res.json = ((data: unknown) => {
@@ -332,7 +334,15 @@ function forwardIssueTool(
   req.method = target.method;
   req.url = target.url;
   req.body = target.body;
-  next("router");
+  issueRouter(req, res, (error?: unknown) => {
+    if (error) {
+      next(error);
+      return;
+    }
+    if (!res.headersSent) {
+      res.status(404).json({ error: "Issue lifecycle route not found" });
+    }
+  });
 }
 
 async function requireIssue(
@@ -369,7 +379,13 @@ function boardActorId(req: Request) {
   return actor;
 }
 
-export function boardMcpRoutes(db: Db, options: { pluginWorkerManager?: PluginWorkerManager } = {}) {
+export function boardMcpRoutes(
+  db: Db,
+  options: {
+    pluginWorkerManager?: PluginWorkerManager;
+    issueRouter?: IssueLifecycleRouter;
+  } = {},
+) {
   const router = Router();
   const svc = issueService(db);
   const heartbeat = heartbeatService(db, { pluginWorkerManager: options.pluginWorkerManager });
@@ -513,9 +529,12 @@ export function boardMcpRoutes(db: Db, options: { pluginWorkerManager?: PluginWo
       }
       const args = params.arguments ?? {};
       if (BOARD_MCP_ISSUE_TOOLS.has(name)) {
+        if (!options.issueRouter) {
+          throw new HttpError(503, "Board issue tools require the normal issue lifecycle router");
+        }
         await authorizeToolCall(req, name, args);
         const target = parseForwardedIssueRequest(name, args);
-        forwardIssueTool(req, res, next, id, target);
+        forwardIssueTool(req, res, next, id, target, options.issueRouter);
         return;
       }
       const data = await executeRunTool(req, name, args);

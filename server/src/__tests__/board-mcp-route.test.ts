@@ -48,13 +48,22 @@ function issue() {
 
 function createApp(actor: Record<string, unknown>, lifecycleEvents: string[] = []) {
   const app = express();
+  const api = express.Router();
+  const issueRouter = express.Router();
   app.use(express.json());
   app.use((req, _res, next) => {
     req.actor = actor as typeof req.actor;
     next();
   });
-  app.use("/api", boardMcpRoutes({} as never));
-  app.post("/api/companies/:companyId/issues", (req, res) => {
+  issueRouter.get("/companies/:companyId/issues", (_req, res) => {
+    lifecycleEvents.push("list");
+    res.json([issue()]);
+  });
+  issueRouter.get("/issues/:issueId", (_req, res) => {
+    lifecycleEvents.push("get");
+    res.json(issue());
+  });
+  issueRouter.post("/companies/:companyId/issues", (req, res) => {
     lifecycleEvents.push("create.assignment");
     lifecycleEvents.push("create.reference_sync");
     if (req.body.idempotencyKey === "duplicate") {
@@ -63,18 +72,21 @@ function createApp(actor: Record<string, unknown>, lifecycleEvents: string[] = [
     }
     res.status(201).json({ ...issue(), ...req.body });
   });
-  app.patch("/api/issues/:issueId", (req, res) => {
+  issueRouter.patch("/issues/:issueId", (req, res) => {
     lifecycleEvents.push("update.status");
     lifecycleEvents.push("update.dependency_wakeup");
     lifecycleEvents.push("update.reference_sync");
     if (req.body.status === "cancelled") lifecycleEvents.push("update.run_cancelled");
     res.json({ ...issue(), ...req.body });
   });
-  app.post("/api/issues/:issueId/comments", (req, res) => {
+  issueRouter.post("/issues/:issueId/comments", (req, res) => {
     lifecycleEvents.push("comment.mention_wakeup");
     lifecycleEvents.push("comment.reference_sync");
     res.status(201).json({ id: "comment-1", issueId: req.params.issueId, body: req.body.body });
   });
+  api.use(boardMcpRoutes({} as never, { issueRouter }));
+  api.use(issueRouter);
+  app.use("/api", api);
   return app;
 }
 
@@ -168,6 +180,27 @@ describe("Board MCP route", () => {
     ]);
     expect(updated.body.result.structuredContent.status).toBe("cancelled");
     expect(commented.body.result.structuredContent.body).toBe("Continue with the replacement");
+  });
+
+  it("dispatches get and list through the shared issue router in the production nested mount", async () => {
+    const lifecycleEvents: string[] = [];
+    const app = createApp(boardActor(), lifecycleEvents);
+
+    const fetched = await callTool(app, "paperclip.board.issue.get", {
+      companyId,
+      issueId: "issue-1",
+    });
+    const listed = await callTool(app, "paperclip.board.issue.list", {
+      companyId,
+      status: ["todo", "in_progress"],
+      assigneeAgentId: null,
+    });
+
+    expect(fetched.status).toBe(200);
+    expect(fetched.body.result.structuredContent.id).toBe("issue-1");
+    expect(listed.status).toBe(200);
+    expect(listed.body.result.structuredContent).toEqual([expect.objectContaining({ id: "issue-1" })]);
+    expect(lifecycleEvents).toEqual(["get", "list"]);
   });
 
   it("preserves the normal create deduplication response without emitting a created audit", async () => {

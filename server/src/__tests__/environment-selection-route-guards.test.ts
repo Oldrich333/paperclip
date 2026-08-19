@@ -141,8 +141,9 @@ function createProjectApp() {
 
 function createIssueApp() {
   issueServer ??= buildApp((expressApp) => {
-    expressApp.use("/api", boardMcpRoutes({} as any));
-    expressApp.use("/api", issueRoutes({} as any, {} as any));
+    const issueRouter = issueRoutes({} as any, {} as any);
+    expressApp.use("/api", boardMcpRoutes({} as any, { issueRouter }));
+    expressApp.use("/api", issueRouter);
   }).listen(0);
   return issueServer;
 }
