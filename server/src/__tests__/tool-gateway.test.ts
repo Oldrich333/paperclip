@@ -1482,6 +1482,103 @@ rl.on("line", (line) => {
     }
   });
 
+  it("keeps a remote connection available after one transient failure and resets the streak on success", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    let failCalls = true;
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => {
+      if (fakeRequest.body?.method === "tools/list") {
+        return {
+          body: { jsonrpc: "2.0", id: fakeRequest.body.id, result: { tools: [] } },
+        };
+      }
+      return failCalls
+        ? { status: 503, body: { error: "unavailable" } }
+        : { body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } } };
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, { url: fake.url, riskLevel: "read" });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      }).then(
+        () => { throw new Error("Expected the transient remote MCP call to fail"); },
+        (error) => expectGatewayError(error, 502, "mcp_remote_status"),
+      );
+      const [degraded] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
+      expect(degraded?.healthStatus).toBe("degraded");
+      expect((await gateway.listToolsForSession(session.token)).some((tool) => tool.connectionId === remoteTool.connection.id)).toBe(true);
+
+      failCalls = false;
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      })).resolves.toMatchObject({ status: "completed" });
+      const [healthy] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
+      expect(healthy?.healthStatus).toBe("ok");
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("demotes only after three consecutive remote failures and self-heals on discovery re-probe", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    let failCalls = true;
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => {
+      if (fakeRequest.body?.method === "tools/list") {
+        return {
+          body: { jsonrpc: "2.0", id: fakeRequest.body.id, result: { tools: [] } },
+        };
+      }
+      return failCalls
+        ? { status: 503, body: { error: "unavailable" } }
+        : { body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "recovered" }] } } };
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, { url: fake.url, riskLevel: "read" });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        }).then(
+          () => { throw new Error("Expected the remote MCP call to fail"); },
+          (error) => expectGatewayError(error, 502, "mcp_remote_status"),
+        );
+        const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
+        expect(connection?.healthStatus).toBe(attempt === 3 ? "error" : "degraded");
+      }
+
+      failCalls = false;
+      const recoveredTools = await gateway.listToolsForSession(session.token);
+      expect(recoveredTools.some((tool) => tool.connectionId === remoteTool.connection.id)).toBe(true);
+      const [recovered] = await db.select().from(toolConnections).where(eq(toolConnections.id, remoteTool.connection.id));
+      expect(recovered?.healthStatus).toBe("ok");
+      expect(fake.requests.some((request) => request.body?.method === "tools/list")).toBe(true);
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("executes a connected remote HTTP MCP tool with stored credentials and redacted audit state", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -1908,7 +2005,23 @@ rl.on("line", (line) => {
         tool: "search_tools",
         parameters: { query: "kv", limit: 5 },
       });
+      expect(search.result.data).toMatchObject({
+        catalogState: "available",
+        emptyReason: null,
+        message: null,
+      });
       expect(JSON.stringify(search.result)).toContain(targetToolName);
+
+      const dottedDisplayName = targetToolName.replace(/:kv-set$/, ":kv.set");
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: dottedDisplayName,
+        parameters: {},
+      })).rejects.toMatchObject({
+        status: 400,
+        reasonCode: "unknown_tool",
+        message: expect.stringContaining("Use the exact name returned by search_tools"),
+      });
 
       const result = await gateway.executeTool({
         sessionToken: session.token,
@@ -1969,6 +2082,35 @@ rl.on("line", (line) => {
     } finally {
       await fake.close();
     }
+  });
+
+  it("reports an explicitly empty on-demand catalog instead of implying session expiry", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remoteTool = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "empty-catalog",
+      toolName: "kv_set",
+    });
+    await db.update(toolConnections)
+      .set({ config: { url: "https://mcp.example.test/mcp", onDemandTools: { enabled: true } } })
+      .where(eq(toolConnections.id, remoteTool.connection.id));
+    await allowToolsForAgent(db, company.id, agent.id, []);
+
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const search = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "search_tools",
+      parameters: {},
+    });
+
+    expect(search.result.data).toMatchObject({
+      tools: [],
+      catalogState: "empty",
+      emptyReason: "no_searchable_tools",
+      message: "No searchable tools are currently available; this is an empty catalog result, not a session-expiry signal.",
+    });
   });
 
   it("decodes an SSE-framed tools/call response from a spec-compliant Streamable HTTP server", async () => {
@@ -2978,7 +3120,10 @@ rl.on("line", (line) => {
         () => {
           throw new Error("Expected cross-company connected MCP tool name to be hidden");
         },
-        (error) => expectGatewayError(error, 404, "tool_not_found"),
+        (error) => {
+          expectGatewayError(error, 400, "unknown_tool");
+          expect((error as ToolGatewayHttpError).message).toContain("Use the exact name returned by search_tools");
+        },
       );
 
       const persisted = JSON.stringify({
@@ -3880,6 +4025,7 @@ rl.on("line", (line) => {
     await expect(gateway.listToolsForSession(session.token)).rejects.toMatchObject({
       status: 401,
       reasonCode: "session_run_inactive",
+      message: "Tool gateway session is not active because its heartbeat run is no longer running.",
     });
     await expect(gateway.createSession({
       companyId: company.id,
@@ -4032,6 +4178,7 @@ rl.on("line", (line) => {
     await expect(gateway.listToolsForSession(expired.token)).rejects.toMatchObject({
       status: 401,
       reasonCode: "session_expired",
+      message: "Tool gateway session expired.",
     });
 
     const revoked = await gateway.createSession({
@@ -4043,6 +4190,7 @@ rl.on("line", (line) => {
     await expect(gateway.listToolsForSession(revoked.token)).rejects.toMatchObject({
       status: 401,
       reasonCode: "session_revoked",
+      message: "Tool gateway session was revoked.",
     });
 
     const tampered = await gateway.createSession({
@@ -4054,6 +4202,7 @@ rl.on("line", (line) => {
     await expect(gateway.listToolsForSession(badToken)).rejects.toMatchObject({
       status: 401,
       reasonCode: "session_invalid",
+      message: "Tool gateway session token is invalid.",
     });
 
     const audits = await db
