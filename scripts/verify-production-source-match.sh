@@ -55,6 +55,24 @@ if ! docker exec -i "$container" tar -C /app --null --no-recursion --files-from=
   exit 1
 fi
 
+declare -A commit_hashes=()
+declare -A container_hashes=()
+load_hashes() {
+  local root="$1"
+  local -n destination="$2"
+  while IFS= read -r -d '' record; do
+    local hash="${record%%  *}"
+    local absolute="${record#*  }"
+    local path="${absolute#"$root"/}"
+    destination["$path"]="$hash"
+  done < <(
+    find "$root" -type f -print0 |
+      xargs -0 -r sha256sum --zero --
+  )
+}
+load_hashes "$workdir/commit" commit_hashes
+load_hashes "$workdir/container" container_hashes
+
 checked=0
 failures=0
 while IFS= read -r -d '' path; do
@@ -85,8 +103,13 @@ while IFS= read -r -d '' path; do
     failures=$((failures + 1))
     continue
   fi
-  commit_hash="$(sha256sum "$commit_file" | awk '{print $1}')"
-  container_hash="$(sha256sum "$container_file" | awk '{print $1}')"
+  if [[ -z "${commit_hashes[$path]+x}" || -z "${container_hashes[$path]+x}" ]]; then
+    printf 'MISSING %s\n' "$path" >&2
+    failures=$((failures + 1))
+    continue
+  fi
+  commit_hash="${commit_hashes[$path]}"
+  container_hash="${container_hashes[$path]}"
   if [[ "$commit_hash" != "$container_hash" ]]; then
     printf 'MISMATCH %s commit=%s container=%s\n' "$path" "$commit_hash" "$container_hash" >&2
     failures=$((failures + 1))
