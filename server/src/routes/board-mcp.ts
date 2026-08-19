@@ -58,7 +58,7 @@ const issueCommentArgsSchema = z.object({
 const runArgsSchema = z.object({
   companyId: companyIdSchema,
   issueId: issueReferenceSchema,
-  runId: z.string().trim().min(1).optional(),
+  runId: z.string().uuid().optional(),
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
 }).strict();
 
@@ -176,7 +176,7 @@ export const BOARD_MCP_TOOLS = [
       properties: {
         companyId: { type: "string" },
         issueId: { type: "string" },
-        runId: { type: "string", description: "Prior run UUID; when omitted Paperclip selects the latest terminal run for this issue." },
+        runId: { type: "string", format: "uuid", description: "Prior run UUID; when omitted Paperclip selects the latest terminal run for this issue." },
         idempotencyKey: { type: "string" },
       },
     },

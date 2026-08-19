@@ -24,6 +24,7 @@ vi.mock("../services/index.js", () => ({
 import { boardMcpRoutes, BOARD_MCP_TOOLS } from "../routes/board-mcp.js";
 
 const companyId = "company-lunacare";
+const priorRunId = "4a39d41c-87de-4ca1-93b6-15e5f0bdf852";
 
 function boardActor(overrides: Record<string, unknown> = {}) {
   return {
@@ -228,10 +229,10 @@ describe("Board MCP route", () => {
 
   it.each([
     ["paperclip.board.run.start", {}],
-    ["paperclip.board.run.resume", { runId: "prior-run" }],
+    ["paperclip.board.run.resume", { runId: priorRunId }],
   ])("does not audit %s when the normal wakeup lifecycle skips it", async (toolName, extraArgs) => {
     mocks.getRun.mockResolvedValue({
-      id: "prior-run",
+      id: priorRunId,
       companyId,
       agentId: "agent-1",
       contextSnapshot: { issueId: "issue-1" },
@@ -348,6 +349,27 @@ describe("Board MCP route", () => {
     expect(response.body.error.message).toContain("agents:create");
     expect(mocks.wakeupWithReceipt).not.toHaveBeenCalled();
     expect(mocks.logActivity).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed resume runId as a tool input error before querying runs", async () => {
+    const response = await callTool(createApp(boardActor()), "paperclip.board.run.resume", {
+      companyId,
+      issueId: "issue-1",
+      runId: "not-a-uuid",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: "Invalid Paperclip Board tool arguments",
+        details: {
+          issues: [expect.objectContaining({ path: ["runId"] })],
+        },
+      },
+    });
+    expect(mocks.getRun).not.toHaveBeenCalled();
+    expect(mocks.wakeupWithReceipt).not.toHaveBeenCalled();
   });
 
   it("reports and audits a coalesced running wake without claiming a new run", async () => {
