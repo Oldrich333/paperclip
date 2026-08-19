@@ -92,8 +92,10 @@ while IFS= read -r -d '' path; do
     fi
     commit_target="$(readlink "$commit_file")"
     container_target="$(readlink "$container_file")"
-    if [[ "$commit_target" != "$container_target" ]]; then
-      printf 'MISMATCH %s commit_target=%s container_target=%s\n' "$path" "$commit_target" "$container_target" >&2
+    commit_hash="$(printf '%s' "$commit_target" | sha256sum | awk '{print $1}')"
+    container_hash="$(printf '%s' "$container_target" | sha256sum | awk '{print $1}')"
+    if [[ "$commit_hash" != "$container_hash" || "$commit_target" != "$container_target" ]]; then
+      printf 'MISMATCH %s commit=%s container=%s targets=%s/%s\n' "$path" "$commit_hash" "$container_hash" "$commit_target" "$container_target" >&2
       failures=$((failures + 1))
     fi
     continue
