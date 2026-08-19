@@ -120,6 +120,7 @@ export interface RuntimeCacheEntry {
   handle: AcpRuntimeHandle;
   childStderrState: ChildStderrState;
   fingerprint: string;
+  processEnvHash: string;
   lastUsedAt: number;
   cleanupTimer?: NodeJS.Timeout;
 }
@@ -1084,6 +1085,18 @@ async function buildRuntime(input: {
   // `env` above and are never present in shapedEnvConfig, so they inherently
   // stay out of the hash and don't reset the session every heartbeat.
   const resolvedAdapterEnv: Record<string, string> = {};
+  const paperclipScratch = parseObject(context.paperclipScratch);
+  const paperclipScratchDir = asString(paperclipScratch.dir, "").trim();
+  const paperclipScratchTempKeys = new Set(
+    (Array.isArray(paperclipScratch.tempKeysApplied) ? paperclipScratch.tempKeysApplied : [])
+      .filter((value): value is string => typeof value === "string"),
+  );
+  const paperclipScratchKeys = new Set([
+    "PAPERCLIP_RUN_SCRATCH_DIR",
+    "PAPERCLIP_TASK_SCRATCH_DIR",
+    "PAPERCLIP_SCRATCH_DIR",
+    "PAPERCLIP_TMPDIR",
+  ]);
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value !== "string") continue;
     // Runtime PAPERCLIP_* always wins over config: skip a PAPERCLIP_* key that
@@ -1094,7 +1107,17 @@ async function buildRuntime(input: {
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;
-    resolvedAdapterEnv[key] = value;
+    const isRunScratchEnv =
+      paperclipScratchDir.length > 0 &&
+      value === paperclipScratchDir &&
+      (paperclipScratchKeys.has(key) || paperclipScratchTempKeys.has(key));
+    // The heartbeat harness injects a new scratch directory for every local run.
+    // It must reach the child process, but it is execution-scoped transport rather
+    // than adapter configuration. Hashing it would reject every saved ACP session
+    // before the provider receives session/resume. Match both key and the attested
+    // scratch value so a real user-configured TMPDIR/TEMP/TMP change still busts
+    // the fingerprint.
+    if (!isRunScratchEnv) resolvedAdapterEnv[key] = value;
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
@@ -1940,7 +1963,22 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     const previousParams = parseObject(ctx.runtime.sessionParams);
     const canResume = isCompatibleSession(previousParams, prepared);
     const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
-    const cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+    // The provider session fingerprint intentionally ignores run-scoped env so
+    // model context survives heartbeats. The ACP child process cannot refresh
+    // sessionOptions.env in place, though, so rotate only that process whenever
+    // its complete env changes; close() preserves the provider session that the
+    // fresh process resumes below with the new run id, JWT, and scratch paths.
+    const processEnvHash = shortHash(prepared.env);
+    let cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+    if (cached && cached.processEnvHash !== processEnvHash) {
+      await closeWarmHandle({
+        handles: warmHandles,
+        key: prepared.sessionKey,
+        entry: cached,
+        reason: "paperclip per-run environment refresh",
+      });
+      cached = undefined;
+    }
     const childStderrState = cached?.childStderrState ?? { logPath: null, pendingLiveLine: "" };
     flushChildStderr(childStderrState);
     childStderrState.logPath = prepared.childStderrLogPath;
@@ -2208,6 +2246,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             handle: sessionHandle,
             childStderrState,
             fingerprint: prepared.fingerprint,
+            processEnvHash,
             lastUsedAt: now(),
           };
           warmHandles.set(prepared.sessionKey, entry);

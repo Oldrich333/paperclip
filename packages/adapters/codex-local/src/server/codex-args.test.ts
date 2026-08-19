@@ -19,6 +19,8 @@ describe("buildCodexExecArgs", () => {
       "--model",
       "gpt-5.4",
       "-c",
+      "model_reasoning_effort=\"xhigh\"",
+      "-c",
       'service_tier="fast"',
       "-c",
       "features.fast_mode=true",
@@ -40,6 +42,8 @@ describe("buildCodexExecArgs", () => {
       "--json",
       "--model",
       "gpt-5.5",
+      "-c",
+      "model_reasoning_effort=\"xhigh\"",
       "-c",
       'service_tier="fast"',
       "-c",
@@ -63,6 +67,8 @@ describe("buildCodexExecArgs", () => {
       "--model",
       "future-codex-model",
       "-c",
+      "model_reasoning_effort=\"xhigh\"",
+      "-c",
       'service_tier="fast"',
       "-c",
       "features.fast_mode=true",
@@ -70,21 +76,21 @@ describe("buildCodexExecArgs", () => {
     ]);
   });
 
-  it("enables Codex fast mode overrides when model is omitted (CLI default)", () => {
+  it("uses Codex adapter defaults when model and reasoning are omitted", () => {
     const result = buildCodexExecArgs({
       fastMode: true,
     });
 
     expect(result.fastModeRequested).toBe(true);
-    expect(result.fastModeApplied).toBe(true);
-    expect(result.fastModeIgnoredReason).toBeNull();
+    expect(result.fastModeApplied).toBe(false);
+    expect(result.fastModeIgnoredReason).toContain("gpt-5.6-luna");
     expect(result.args).toEqual([
       "exec",
       "--json",
+      "--model",
+      "gpt-5.6-luna",
       "-c",
-      'service_tier="fast"',
-      "-c",
-      "features.fast_mode=true",
+      "model_reasoning_effort=\"xhigh\"",
       "-",
     ]);
   });
@@ -95,6 +101,10 @@ describe("buildCodexExecArgs", () => {
     expect(result.args).toEqual([
       "exec",
       "--json",
+      "--model",
+      "gpt-5.6-luna",
+      "-c",
+      "model_reasoning_effort=\"xhigh\"",
       "-c",
       'developer_instructions="shared contract"',
       "-c",
@@ -112,6 +122,10 @@ describe("buildCodexExecArgs", () => {
     expect(result.args).toEqual([
       "exec",
       "--json",
+      "--model",
+      "gpt-5.6-luna",
+      "-c",
+      "model_reasoning_effort=\"xhigh\"",
       "-c",
       'model_instructions_file="/opt/hive-prompts/codex_model_instructions.md"',
       "-c",
@@ -138,6 +152,8 @@ describe("buildCodexExecArgs", () => {
       "--json",
       "--model",
       "gpt-5.3-codex-spark",
+      "-c",
+      "model_reasoning_effort=\"xhigh\"",
       "-",
     ]);
   });
@@ -155,6 +171,8 @@ describe("buildCodexExecArgs", () => {
       "--json",
       "--model",
       "gpt-5.4-mini",
+      "-c",
+      "model_reasoning_effort=\"xhigh\"",
       "-",
     ]);
   });
@@ -173,6 +191,8 @@ describe("buildCodexExecArgs", () => {
       "--skip-git-repo-check",
       "--model",
       "gpt-5.5",
+      "-c",
+      "model_reasoning_effort=\"xhigh\"",
       "-",
     ]);
   });

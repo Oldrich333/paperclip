@@ -67,6 +67,7 @@ import {
   prepareManagedCodexHome,
   resolveManagedCodexHomeDir,
   resolveSharedCodexHomeDir,
+  selectManagedCodexMcpGateways,
   seedManagedCodexHome,
   stageCodexHomeForSync,
   mergeManagedCodexMcpGateways,
@@ -268,7 +269,7 @@ function fallbackModeUsesFreshSession(mode: CodexTransientFallbackMode | null): 
   return mode === "fresh_session" || mode === "fresh_session_safer_invocation";
 }
 
-function managedMcpGatewaysFromContext(context: Record<string, unknown>): ManagedCodexMcpGateway[] {
+export function managedMcpGatewaysFromContext(context: Record<string, unknown>): ManagedCodexMcpGateway[] {
   const managedMcp = parseObject(context.paperclipManagedMcp);
   if (managedMcp.managedMcpOnly !== true) return [];
   const gateways = Array.isArray(managedMcp.gateways) ? managedMcp.gateways : [];
@@ -279,7 +280,12 @@ function managedMcpGatewaysFromContext(context: Record<string, unknown>): Manage
       const endpointPath = asString(gateway.endpointPath, "").trim();
       const bearerToken = asString(gateway.bearerToken, "").trim();
       if (!name || !endpointPath || !bearerToken) return null;
-      return { name, endpointPath, bearerToken };
+      return {
+        name,
+        endpointPath,
+        bearerToken,
+        contextScoped: gateway.contextScoped === true,
+      };
     })
     .filter((gateway): gateway is ManagedCodexMcpGateway => Boolean(gateway));
 }
@@ -544,13 +550,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (configuredCodexHome == null) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
+      agentId: agent.id,
     });
   } else if (configuredHomeIsManaged) {
     await seedManagedCodexHome(configuredCodexHome, process.env, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
   }
-  const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
+  // MCP gateway policy is agent-specific. A company-shared config.toml lets
+  // concurrent runs overwrite one another's managed MCP block, so every agent
+  // must use its own managed home even when all agents share host credentials.
+  const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId, agent.id);
   const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
 
@@ -603,9 +613,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       endpointPath: server.url,
       bearerToken: server.token,
     }));
-    const managedMcpGateways = mergeManagedCodexMcpGateways(
-      runtimeMcpGateways,
-      managedMcpGatewaysFromContext(context),
+    const managedMcpGateways = selectManagedCodexMcpGateways(
+      mergeManagedCodexMcpGateways(
+        runtimeMcpGateways,
+        managedMcpGatewaysFromContext(context),
+      ),
     );
     const managedMcp = await writeManagedCodexMcpConfig({
       codexHome: effectiveCodexHome,

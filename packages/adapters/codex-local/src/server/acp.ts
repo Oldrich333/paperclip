@@ -20,6 +20,10 @@ import {
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
+  DEFAULT_CODEX_LOCAL_MODEL,
+  DEFAULT_CODEX_LOCAL_REASONING_EFFORT,
+} from "../index.js";
+import {
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
   DEFAULT_ACP_ENGINE_PERMISSION_MODE,
@@ -106,6 +110,10 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
 }
 
 export function buildCodexAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const model = firstNonEmptyString(config.model) ?? DEFAULT_CODEX_LOCAL_MODEL;
+  const modelReasoningEffort =
+    firstNonEmptyString(config.modelReasoningEffort, config.reasoningEffort) ??
+    DEFAULT_CODEX_LOCAL_REASONING_EFFORT;
   const agentCommand = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
   const stateDir = firstNonEmptyString(config.stateDir, config.acpStateDir);
   const mode = firstNonEmptyString(config.mode, config.acpMode) ?? DEFAULT_ACP_ENGINE_MODE;
@@ -123,6 +131,8 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
   return {
     ...config,
     agent: "codex",
+    model,
+    modelReasoningEffort,
     mode,
     permissionMode,
     nonInteractivePermissions,

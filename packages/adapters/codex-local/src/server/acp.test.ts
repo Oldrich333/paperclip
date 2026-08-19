@@ -379,6 +379,25 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it("applies Codex model and reasoning defaults in ACP when omitted", () => {
+    expect(buildCodexAcpConfig({
+      engine: "acp",
+      reasoningEffort: "high",
+    })).toMatchObject({
+      agent: "codex",
+      model: "gpt-5.6-luna",
+      modelReasoningEffort: "high",
+    });
+
+    expect(buildCodexAcpConfig({
+      engine: "acp",
+    })).toMatchObject({
+      agent: "codex",
+      model: "gpt-5.6-luna",
+      modelReasoningEffort: "xhigh",
+    });
+  });
+
   it("checks the Node version required by the ACPX runtime", () => {
     setNodeVersion("v22.12.0");
     expect(nodeVersionMeetsCodexAcpMinimum()).toBe(false);

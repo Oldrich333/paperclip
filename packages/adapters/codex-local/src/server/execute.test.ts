@@ -57,7 +57,28 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { execute } from "./execute.js";
+import { execute, managedMcpGatewaysFromContext } from "./execute.js";
+
+describe("managedMcpGatewaysFromContext", () => {
+  it("preserves the server-computed context scope used to narrow gateway delivery", () => {
+    expect(managedMcpGatewaysFromContext({
+      paperclipManagedMcp: {
+        managedMcpOnly: true,
+        gateways: [{
+          name: "standing-google-ads",
+          endpointPath: "/api/tool-gateway/gateways/google/mcp",
+          bearerToken: "run-token",
+          contextScoped: true,
+        }],
+      },
+    })).toEqual([{
+      name: "standing-google-ads",
+      endpointPath: "/api/tool-gateway/gateways/google/mcp",
+      bearerToken: "run-token",
+      contextScoped: true,
+    }]);
+  });
+});
 
 // Mirror the sandbox core's restore closure: capture the assets `execute()`
 // declares, then during teardown invoke each asset's `restore` with an injected

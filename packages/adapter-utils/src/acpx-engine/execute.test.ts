@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
@@ -721,6 +723,66 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(fp(sameEnvNewWake)).toBe(fp(first));
   });
 
+  it("forwards per-run scratch env without rotating the ACPX session fingerprint", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const firstScratch = path.join(root, "paperclip-run-1");
+    const secondScratch = path.join(root, "paperclip-run-2");
+    const scratchEnv = (dir: string) => ({
+      PAPERCLIP_RUN_SCRATCH_DIR: dir,
+      PAPERCLIP_TASK_SCRATCH_DIR: dir,
+      PAPERCLIP_SCRATCH_DIR: dir,
+      PAPERCLIP_TMPDIR: dir,
+      TMPDIR: dir,
+      TEMP: dir,
+      TMP: dir,
+    });
+    const scratchContext = (dir: string) => ({
+      taskId: "issue-1",
+      paperclipScratch: {
+        type: "heartbeat_run",
+        dir,
+        tempKeysApplied: ["TMPDIR", "TEMP", "TMP"],
+      },
+    });
+
+    const first = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: scratchEnv(firstScratch) },
+      { context: scratchContext(firstScratch) },
+    );
+    const second = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: scratchEnv(secondScratch) },
+      { context: scratchContext(secondScratch) },
+    );
+    const firstParams = first.result.sessionParams as { configFingerprint?: string; sessionKey?: string };
+    const secondParams = second.result.sessionParams as { configFingerprint?: string; sessionKey?: string };
+    const firstEnv = (first.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+    const secondEnv = (second.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+
+    expect(firstEnv.TMPDIR).toBe(firstScratch);
+    expect(secondEnv.TMPDIR).toBe(secondScratch);
+    expect(secondParams.configFingerprint).toBe(firstParams.configFingerprint);
+    expect(secondParams.sessionKey).toBe(firstParams.sessionKey);
+  });
+
+  it("still rotates the ACPX fingerprint for a user-configured TMPDIR", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const first = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: { TMPDIR: path.join(root, "configured-1") } },
+      { context: { taskId: "issue-1" } },
+    );
+    const second = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: { TMPDIR: path.join(root, "configured-2") } },
+      { context: { taskId: "issue-1" } },
+    );
+    const fp = (result: { result: { sessionParams?: unknown } }) =>
+      (result.result.sessionParams as { configFingerprint?: string } | undefined)?.configFingerprint;
+
+    expect(fp(first)).toBeDefined();
+    expect(fp(second)).not.toBe(fp(first));
+  });
+
   it("busts the session fingerprint when a stable configured PAPERCLIP_* value rotates", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
@@ -956,7 +1018,7 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(runLog).toContain("some genuine crash");
   });
 
-  it("routes reused warm-runtime stderr to the current run log", async () => {
+  it("routes persistent-runtime stderr to the current run log", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const warmHandles = new Map();
@@ -998,6 +1060,251 @@ describe("shared ACPX engine runtime behavior", () => {
     await expect(fs.readFile(path.join(stateDir, "run-stderr", "run-warm-1.log"), "utf8")).rejects.toThrow();
     await expect(fs.readFile(path.join(stateDir, "run-stderr", "run-warm-2.log"), "utf8")).resolves.toContain("current-run-stderr");
   });
+
+  it("restarts a warm ACP process with fresh per-run env while resuming its provider session", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const warmHandles = new Map();
+    const events: string[] = [];
+    const sessionInputs: Array<{ runtime: number; input: Record<string, unknown> }> = [];
+    let runtimeCount = 0;
+    const execute = createAcpxEngineExecutor({
+      warmHandles,
+      createRuntime: () => {
+        runtimeCount += 1;
+        const runtimeNumber = runtimeCount;
+        return {
+          ensureSession: async (input: Record<string, unknown>) => {
+            events.push(`ensure-${runtimeNumber}`);
+            sessionInputs.push({ runtime: runtimeNumber, input });
+            const resumed = typeof input.resumeSessionId === "string" ? input.resumeSessionId : null;
+            return {
+              backendSessionId: resumed ?? "provider-session-1",
+              agentSessionId: resumed ?? "provider-session-1",
+              runtimeSessionName: `runtime-${runtimeNumber}`,
+            };
+          },
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async () => {
+            events.push(`close-${runtimeNumber}`);
+          },
+        } as never;
+      },
+    });
+    const config = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      mode: "persistent",
+      warmHandleIdleMs: 60_000,
+    };
+    const firstScratch = path.join(root, "paperclip-run-1");
+    const secondScratch = path.join(root, "paperclip-run-2");
+    const scratchEnv = (dir: string) => ({
+      PAPERCLIP_RUN_SCRATCH_DIR: dir,
+      PAPERCLIP_TASK_SCRATCH_DIR: dir,
+      PAPERCLIP_SCRATCH_DIR: dir,
+      PAPERCLIP_TMPDIR: dir,
+      TMPDIR: dir,
+      TEMP: dir,
+      TMP: dir,
+    });
+    const scratchContext = (dir: string) => ({
+      taskId: "issue-1",
+      paperclipScratch: {
+        type: "heartbeat_run",
+        dir,
+        tempKeysApplied: ["TMPDIR", "TEMP", "TMP"],
+      },
+    });
+    const first = await execute({
+      runId: "run-refresh-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { ...config, env: scratchEnv(firstScratch) },
+      context: scratchContext(firstScratch),
+      authToken: "jwt-for-run-1",
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+    const second = await execute({
+      runId: "run-refresh-2",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: { sessionParams: first.sessionParams },
+      config: { ...config, env: scratchEnv(secondScratch) },
+      context: scratchContext(secondScratch),
+      authToken: "jwt-for-run-2",
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(first.exitCode).toBe(0);
+    expect(second.exitCode).toBe(0);
+    expect(runtimeCount).toBe(2);
+    expect(events).toEqual(["ensure-1", "close-1", "ensure-2"]);
+    expect(sessionInputs).toHaveLength(2);
+    const firstInput = sessionInputs[0]!.input;
+    const secondInput = sessionInputs[1]!.input;
+    const firstEnv = (firstInput.sessionOptions as { env: Record<string, string> }).env;
+    const secondEnv = (secondInput.sessionOptions as { env: Record<string, string> }).env;
+    expect(firstEnv).toMatchObject({
+      PAPERCLIP_RUN_ID: "run-refresh-1",
+      PAPERCLIP_API_KEY: "jwt-for-run-1",
+      TMPDIR: firstScratch,
+    });
+    expect(secondEnv).toMatchObject({
+      PAPERCLIP_RUN_ID: "run-refresh-2",
+      PAPERCLIP_API_KEY: "jwt-for-run-2",
+      TMPDIR: secondScratch,
+    });
+    expect(secondInput.resumeSessionId).toBe("provider-session-1");
+    expect(second.sessionId).toBe("provider-session-1");
+  });
+
+  it.each([0, 60_000])(
+    "refreshes the real ACPX launch env and resumes the provider session with warmHandleIdleMs=%i",
+    async (warmHandleIdleMs) => {
+      const root = await makeTempRoot();
+      const stateDir = path.join(root, "state");
+      const fixturePath = path.join(root, "env-echo-agent.mjs");
+      const require = createRequire(import.meta.url);
+      const acpxPackageDir = path.dirname(path.dirname(require.resolve("acpx/runtime")));
+      const requireFromAcpx = createRequire(path.join(acpxPackageDir, "package.json"));
+      const sdkUrl = pathToFileURL(requireFromAcpx.resolve("@agentclientprotocol/sdk")).href;
+      await fs.writeFile(
+        fixturePath,
+        `import * as acp from ${JSON.stringify(sdkUrl)};
+import { Readable, Writable } from "node:stream";
+const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
+acp.agent({ name: "paperclip-env-echo" })
+  .onRequest(acp.methods.agent.initialize, () => ({
+    protocolVersion: acp.PROTOCOL_VERSION,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(acp.methods.agent.session.new, () => ({ sessionId: globalThis.crypto.randomUUID() }))
+  .onRequest(acp.methods.agent.session.load, () => ({}))
+  .onRequest(acp.methods.agent.authenticate, () => ({}))
+  .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
+    await ctx.client.notify(acp.methods.client.session.update, {
+      sessionId: ctx.params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: JSON.stringify({
+            sessionId: ctx.params.sessionId,
+            pid: process.pid,
+            runId: process.env.PAPERCLIP_RUN_ID,
+            apiKey: process.env.PAPERCLIP_API_KEY,
+            tmpdir: process.env.TMPDIR,
+          }),
+        },
+      },
+    });
+    return { stopReason: "end_turn" };
+  })
+  .onNotification(acp.methods.agent.session.cancel, () => {})
+  .connect(stream);
+`,
+        "utf8",
+      );
+      const warmHandles = new Map();
+      const execute = createAcpxEngineExecutor({ warmHandles });
+      const firstScratch = path.join(root, "paperclip-run-1");
+      const secondScratch = path.join(root, "paperclip-run-2");
+      const scratchEnv = (dir: string) => ({
+        PAPERCLIP_RUN_SCRATCH_DIR: dir,
+        PAPERCLIP_TASK_SCRATCH_DIR: dir,
+        PAPERCLIP_SCRATCH_DIR: dir,
+        PAPERCLIP_TMPDIR: dir,
+        TMPDIR: dir,
+        TEMP: dir,
+        TMP: dir,
+      });
+      const scratchContext = (dir: string) => ({
+        taskId: "issue-real-acpx",
+        paperclipScratch: {
+          type: "heartbeat_run",
+          dir,
+          tempKeysApplied: ["TMPDIR", "TEMP", "TMP"],
+        },
+      });
+      const baseConfig = {
+        agent: "custom",
+        agentCommand: `node ${fixturePath}`,
+        stateDir,
+        cwd: root,
+        mode: "persistent",
+        warmHandleIdleMs,
+      };
+      try {
+        const first = await execute({
+          runId: "run-real-1",
+          agent: { id: "agent-1", companyId: "company-1" },
+          runtime: {},
+          config: { ...baseConfig, env: scratchEnv(firstScratch) },
+          context: scratchContext(firstScratch),
+          authToken: "jwt-real-1",
+          onLog: async () => {},
+          onMeta: async () => {},
+        } as never);
+        const second = await execute({
+          runId: "run-real-2",
+          agent: { id: "agent-1", companyId: "company-1" },
+          runtime: { sessionParams: first.sessionParams },
+          config: { ...baseConfig, env: scratchEnv(secondScratch) },
+          context: scratchContext(secondScratch),
+          authToken: "jwt-real-2",
+          onLog: async () => {},
+          onMeta: async () => {},
+        } as never);
+
+        expect(first.exitCode).toBe(0);
+        expect(second.exitCode).toBe(0);
+        const firstEcho = JSON.parse(first.summary ?? "{}") as Record<string, unknown>;
+        const secondEcho = JSON.parse(second.summary ?? "{}") as Record<string, unknown>;
+        expect(second.sessionId).toBe(first.sessionId);
+        expect(secondEcho.sessionId).toBe(firstEcho.sessionId);
+        expect(secondEcho.pid).not.toBe(firstEcho.pid);
+        expect(firstEcho).toMatchObject({
+          runId: "run-real-1",
+          apiKey: "jwt-real-1",
+          tmpdir: firstScratch,
+        });
+        expect(secondEcho).toMatchObject({
+          runId: "run-real-2",
+          apiKey: "jwt-real-2",
+          tmpdir: secondScratch,
+        });
+
+        const sessionFiles = await fs.readdir(path.join(stateDir, "sessions"));
+        expect(sessionFiles).toHaveLength(1);
+        const stored = JSON.parse(
+          await fs.readFile(path.join(stateDir, "sessions", sessionFiles[0]!), "utf8"),
+        ) as { acpx?: { session_options?: { env?: Record<string, string> } } };
+        expect(stored.acpx?.session_options?.env).toMatchObject({
+          PAPERCLIP_RUN_ID: "run-real-2",
+          PAPERCLIP_API_KEY: "jwt-real-2",
+          TMPDIR: secondScratch,
+        });
+      } finally {
+        await Promise.all(
+          [...warmHandles.values()].map((entry) =>
+            entry.runtime.close({
+              handle: entry.handle,
+              reason: "test cleanup",
+              discardPersistentState: false,
+            }),
+          ),
+        );
+        warmHandles.clear();
+      }
+    },
+  );
 
   it("passes Paperclip env through ACPX session options instead of process.env", async () => {
     let observedSessionEnv: Record<string, string> | undefined;

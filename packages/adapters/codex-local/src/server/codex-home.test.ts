@@ -11,9 +11,12 @@ import {
   isManagedCodexHomePath,
   prepareManagedCodexHome,
   reconcileManagedCodexHome,
+  resolveManagedCodexHomeDir,
+  selectManagedCodexMcpGateways,
   seedManagedCodexHome,
   stageCodexHomeForSync,
   writeManagedCodexMcpConfig,
+  type ManagedCodexMcpGateway,
 } from "./codex-home.js";
 
 describe("mergeManagedCodexMcpGateways", () => {
@@ -30,6 +33,47 @@ describe("mergeManagedCodexMcpGateways", () => {
       { name: "runtime", endpointPath: "/runtime", bearerToken: "runtime-token" },
       { name: "manual", endpointPath: "/manual", bearerToken: "manual-token" },
     ]);
+  });
+});
+
+describe("selectManagedCodexMcpGateways", () => {
+  const gateway = (name: string, contextScoped?: boolean): ManagedCodexMcpGateway => ({
+    name,
+    endpointPath: `/${name}`,
+    bearerToken: `${name}-token`,
+    ...(contextScoped === undefined ? {} : { contextScoped }),
+  });
+
+  it("keeps the gateways bound to this run and drops the company-wide ones", () => {
+    expect(selectManagedCodexMcpGateways([
+      gateway("runtime-commerce", false),
+      gateway("lunacare_support_intake_issue_tools", true),
+      gateway("support-case-tools", true),
+    ])).toEqual([
+      gateway("lunacare_support_intake_issue_tools", true),
+      gateway("support-case-tools", true),
+    ]);
+  });
+
+  it("never drops a run-bound gateway because another gateway is named issue tools", () => {
+    // The 2026-08-17 outage: a project-wide intake gateway carrying two queue reads evicted the
+    // support agent's only route to Chatwoot for a day, purely because its slug ended in
+    // issue_tools. Both are bound to the run, so both must survive.
+    const evicted = gateway("support-case-tools", true);
+    expect(
+      selectManagedCodexMcpGateways([gateway("lunacare_support_intake_issue_tools", true), evicted]),
+    ).toContainEqual(evicted);
+  });
+
+  it("ignores the name entirely, so renaming a gateway cannot change capability", () => {
+    const named = gateway("anything_issue_tools_shaped", false);
+    const scoped = gateway("plain-name", true);
+    expect(selectManagedCodexMcpGateways([named, scoped])).toEqual([scoped]);
+  });
+
+  it("keeps every provider surface when nothing is bound to this run", () => {
+    const gateways = [gateway("runtime-commerce", false), gateway("runtime-insight")];
+    expect(selectManagedCodexMcpGateways(gateways)).toEqual(gateways);
   });
 });
 
@@ -263,6 +307,21 @@ describe("isManagedCodexHomePath", () => {
   it("returns false without a companyId", () => {
     expect(isManagedCodexHomePath(env, undefined, path.join(companyRoot, "codex-home"))).toBe(
       false,
+    );
+  });
+});
+
+describe("resolveManagedCodexHomeDir", () => {
+  const env = {
+    PAPERCLIP_HOME: "/srv/paperclip",
+    PAPERCLIP_INSTANCE_ID: "default",
+  } satisfies NodeJS.ProcessEnv;
+
+  it("isolates an agent home beneath its company", () => {
+    expect(resolveManagedCodexHomeDir(env, "company-1", "agent-7")).toBe(
+      path.resolve(
+        "/srv/paperclip/instances/default/companies/company-1/agents/agent-7/codex-home",
+      ),
     );
   });
 });
@@ -872,7 +931,7 @@ describe("stageCodexHomeForSync", () => {
       // and is persisted 0600 on disk.
       await fs.writeFile(
         path.join(home, "config.toml"),
-        "[mcp_servers.paperclip]\nheaders = { Authorization = \"Bearer secret-token\" }\n",
+        "[mcp_servers.paperclip]\nhttp_headers = { Authorization = \"Bearer secret-token\" }\n",
         { mode: 0o600 },
       );
       staged = await stageCodexHomeForSync(home, { runId: "run-toml-mode" });

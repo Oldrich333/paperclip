@@ -59,12 +59,24 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
+ARG CURSOR_VERSION=2026.08.11-e8db854
+ARG CURSOR_SHA256=bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a
 WORKDIR /app
 COPY --chown=node:node --from=build /app /app
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
+  && install -d -m 0755 "/opt/cursor-agent/${CURSOR_VERSION}" \
+  && curl -fsSL \
+    "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/x64/agent-cli-package.tar.gz" \
+    -o /tmp/cursor-agent.tar.gz \
+  && echo "${CURSOR_SHA256}  /tmp/cursor-agent.tar.gz" | sha256sum --check --strict \
+  && tar --strip-components=1 -xzf /tmp/cursor-agent.tar.gz -C "/opt/cursor-agent/${CURSOR_VERSION}" \
+  && ln -s "/opt/cursor-agent/${CURSOR_VERSION}/cursor-agent" /usr/local/bin/agent \
+  && ln -s "/opt/cursor-agent/${CURSOR_VERSION}/cursor-agent" /usr/local/bin/cursor-agent \
+  && rm /tmp/cursor-agent.tar.gz \
+  && test "$(cursor-agent --version)" = "${CURSOR_VERSION}" \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 

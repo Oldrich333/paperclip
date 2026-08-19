@@ -30,6 +30,8 @@ export type ManagedCodexMcpGateway = {
   name: string;
   endpointPath: string;
   bearerToken: string;
+  /** True when Paperclip bound this gateway to the run's agent, project or issue. */
+  contextScoped?: boolean;
 };
 
 export function mergeManagedCodexMcpGateways(
@@ -44,6 +46,35 @@ export function mergeManagedCodexMcpGateways(
     names.add(gateway.name);
   }
   return merged;
+}
+
+/**
+ * Codex 0.147 can drop all deferred tools when many gateway servers expose the
+ * same aggregate tool names (`search_tools` / `run_tool`). An issue aggregate
+ * is already the signed, policy-bounded capability surface for that run, so it
+ * must replace the redundant provider surfaces instead of being added beside
+ * them. This mirrors the remote runtime compatibility wrapper.
+ */
+/**
+ * Narrow the delivered gateway set to the ones bound to this run.
+ *
+ * Codex 0.147 loses deferred tools when a dozen provider gateways all export the same
+ * `search_tools`/`run_tool` names, so a large set has to be narrowed. This used to be done by
+ * testing the server name for an `issue_tools` substring, which silently dropped any purpose-built
+ * gateway whose slug did not happen to carry it — on 2026-08-17 that removed a support agent's only
+ * route to Chatwoot for a day while every profile, catalog entry and token looked healthy.
+ *
+ * Scope is the honest discriminator and Paperclip already computed it: `contextScoped` marks the
+ * gateways bound to this run's agent, project or issue. Renaming a gateway can no longer change an
+ * agent's effective capability, and a gateway carrying `issue_tools` by coincidence can no longer
+ * evict the one an agent actually needs. When nothing is context-scoped there is nothing to prefer,
+ * so the full set is delivered unchanged.
+ */
+export function selectManagedCodexMcpGateways(
+  gateways: ManagedCodexMcpGateway[],
+): ManagedCodexMcpGateway[] {
+  const scoped = gateways.filter((gateway) => gateway.contextScoped === true);
+  return scoped.length > 0 ? scoped : gateways;
 }
 
 function nonEmpty(value: string | undefined): string | null {
@@ -105,15 +136,17 @@ function isWorktreeMode(env: NodeJS.ProcessEnv): boolean {
 export function resolveManagedCodexHomeDir(
   env: NodeJS.ProcessEnv,
   companyId?: string,
+  agentId?: string,
 ): string {
   const instanceRoot = resolvePaperclipInstanceRootForAdapter({
     homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
     instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
     env,
   });
-  return companyId
-    ? path.resolve(instanceRoot, "companies", companyId, "codex-home")
-    : path.resolve(instanceRoot, "codex-home");
+  if (!companyId) return path.resolve(instanceRoot, "codex-home");
+  return agentId
+    ? path.resolve(instanceRoot, "companies", companyId, "agents", agentId, "codex-home")
+    : path.resolve(instanceRoot, "companies", companyId, "codex-home");
 }
 
 /**
@@ -292,7 +325,7 @@ function buildManagedMcpBlock(input: {
       "",
       `[mcp_servers.${tomlString(managedName)}]`,
       `url = ${tomlString(url)}`,
-      `headers = { Authorization = ${tomlString(`Bearer ${gateway.bearerToken}`)} }`,
+      `http_headers = { Authorization = ${tomlString(`Bearer ${gateway.bearerToken}`)} }`,
     );
   });
   lines.push(MANAGED_MCP_BLOCK_END);
@@ -632,9 +665,9 @@ export async function prepareManagedCodexHome(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
   companyId?: string,
-  options: { apiKey?: string | null } = {},
+  options: { apiKey?: string | null; agentId?: string } = {},
 ): Promise<string> {
-  const targetHome = resolveManagedCodexHomeDir(env, companyId);
+  const targetHome = resolveManagedCodexHomeDir(env, companyId, options.agentId);
   await seedManagedCodexHome(targetHome, env, onLog, options);
   return targetHome;
 }
