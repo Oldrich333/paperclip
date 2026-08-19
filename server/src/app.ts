@@ -369,7 +369,6 @@ export async function createApp(
 
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
-  api.use(boardMcpRoutes(db, { pluginWorkerManager: workerManager }));
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
@@ -402,6 +401,7 @@ export async function createApp(
   // Mount API routes
   const api = Router();
   api.use(boardMutationGuard());
+  api.use(boardMcpRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(
     "/health",
     healthRoutes(db, {
