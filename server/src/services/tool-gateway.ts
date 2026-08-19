@@ -1405,7 +1405,11 @@ export function createToolGatewayService(
       await writeSessionAuthFailure(row, "session_run_inactive", {
         runStatus: run?.status ?? null,
       });
-      throw new ToolGatewayHttpError(401, "Tool gateway session is expired or invalid", "session_run_inactive");
+      throw new ToolGatewayHttpError(
+        401,
+        "Tool gateway session is not active because its heartbeat run is no longer running.",
+        "session_run_inactive",
+      );
     }
   }
 
@@ -1420,7 +1424,7 @@ export function createToolGatewayService(
   ): Promise<ToolGatewaySession> {
     const token = sessionToken.trim();
     if (!token) {
-      throw new ToolGatewayHttpError(401, "Tool gateway session is expired or invalid", "session_invalid");
+      throw new ToolGatewayHttpError(401, "Tool gateway session token is invalid.", "session_invalid");
     }
     if (namedGatewayTokenId(token)) {
       return namedGatewaySessionFromBearer({
@@ -1451,17 +1455,17 @@ export function createToolGatewayService(
           await writeSessionAuthFailure(candidate, "session_invalid");
         }
       }
-      throw new ToolGatewayHttpError(401, "Tool gateway session is expired or invalid", "session_invalid");
+      throw new ToolGatewayHttpError(401, "Tool gateway session token is invalid.", "session_invalid");
     }
 
     if (row.revokedAt) {
       await writeSessionAuthFailure(row, "session_revoked");
-      throw new ToolGatewayHttpError(401, "Tool gateway session is expired or invalid", "session_revoked");
+      throw new ToolGatewayHttpError(401, "Tool gateway session was revoked.", "session_revoked");
     }
 
     if (row.expiresAt.getTime() <= Date.now()) {
       await writeSessionAuthFailure(row, "session_expired");
-      throw new ToolGatewayHttpError(401, "Tool gateway session is expired or invalid", "session_expired");
+      throw new ToolGatewayHttpError(401, "Tool gateway session expired.", "session_expired");
     }
 
     await assertSessionRunIsActive(row);
@@ -2010,6 +2014,21 @@ export function createToolGatewayService(
     return tool;
   }
 
+  const GATEWAY_TOOL_NAME_FORMAT = "mcp.<connection-slug>-<id8>:<dashed-tool-name>";
+
+  function unknownGatewayToolError(toolName: string): ToolGatewayHttpError {
+    return new ToolGatewayHttpError(
+      400,
+      `Unknown tool "${toolName}". Use the exact name returned by search_tools (${GATEWAY_TOOL_NAME_FORMAT}); upstream dotted display names are not valid gateway names.`,
+      "unknown_tool",
+      {
+        tool: toolName,
+        expectedNameSource: "search_tools",
+        expectedNameFormat: GATEWAY_TOOL_NAME_FORMAT,
+      },
+    );
+  }
+
   async function findToolForSession(session: ToolGatewaySession, toolName: string): Promise<ToolGatewayDescriptor> {
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
@@ -2018,7 +2037,7 @@ export function createToolGatewayService(
       .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
       .find((candidate) => candidate.name === toolName);
     if (!tool) {
-      throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found`, "tool_not_found", { tool: toolName });
+      throw unknownGatewayToolError(toolName);
     }
     return tool;
   }
@@ -2092,7 +2111,8 @@ export function createToolGatewayService(
     const params = asRecord(parameters) ?? {};
     const query = typeof params.query === "string" ? params.query.trim().toLowerCase() : "";
     const limit = Math.max(1, Math.min(50, Number(params.limit ?? 10) || 10));
-    const tools = (await searchableOnDemandTools(session))
+    const searchableTools = await searchableOnDemandTools(session);
+    const tools = searchableTools
       .filter((tool) => {
         if (!query) return true;
         return [
@@ -2117,9 +2137,22 @@ export function createToolGatewayService(
         risk: tool.risk,
       }));
 
+    const catalogState = tools.length > 0 ? "available" : "empty";
+    const emptyReason = tools.length > 0
+      ? null
+      : searchableTools.length === 0
+        ? "no_searchable_tools"
+        : "no_matching_tools";
+    const message = tools.length > 0
+      ? null
+      : searchableTools.length === 0
+        ? "No searchable tools are currently available; this is an empty catalog result, not a session-expiry signal."
+        : "No tools matched this search.";
+    const result = { tools, catalogState, emptyReason, message };
+
     return {
-      content: JSON.stringify({ tools }),
-      data: { tools },
+      content: JSON.stringify(result),
+      data: result,
     };
   }
 
@@ -5932,7 +5965,7 @@ export function createToolGatewayService(
         const { targetToolName, targetParameters, asyncExecution: requestedAsyncExecution, timeoutMs: virtualTimeoutMs, idempotencyKey: virtualIdempotencyKey } = virtualRunToolInput(requestedParameters);
         const targetTool = await findToolForSession(session, targetToolName);
         if (!isOnDemandRemoteTool(targetTool)) {
-          throw new ToolGatewayHttpError(404, `Tool "${targetToolName}" not found`, "tool_not_found", { tool: targetToolName });
+          throw unknownGatewayToolError(targetToolName);
         }
         virtualToolName = "run_tool";
         tool = targetTool;
