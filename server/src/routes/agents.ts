@@ -89,7 +89,11 @@ import {
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
-import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
+import {
+  DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
+  DEFAULT_CODEX_LOCAL_MODEL,
+  DEFAULT_CODEX_LOCAL_REASONING_EFFORT,
+} from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
@@ -1279,6 +1283,17 @@ export function agentRoutes(
   ): Record<string, unknown> {
     const next = { ...adapterConfig };
     if (adapterType === "codex_local") {
+      if (!asNonEmptyString(next.model)) {
+        next.model = DEFAULT_CODEX_LOCAL_MODEL;
+      }
+      const configuredReasoningEffort =
+        asNonEmptyString(next.modelReasoningEffort) ??
+        asNonEmptyString(next.reasoningEffort);
+      if (configuredReasoningEffort) {
+        next.modelReasoningEffort = configuredReasoningEffort;
+      } else {
+        next.modelReasoningEffort = DEFAULT_CODEX_LOCAL_REASONING_EFFORT;
+      }
       const hasBypassFlag =
         typeof next.dangerouslyBypassApprovalsAndSandbox === "boolean" ||
         typeof next.dangerouslyBypassSandbox === "boolean";
@@ -2988,7 +3003,9 @@ export function agentRoutes(
       ) {
         await assertCanManageInstructionsPath(req, existing);
       }
-      let rawEffectiveAdapterConfig = requestedAdapterConfig ?? existingAdapterConfig;
+      let rawEffectiveAdapterConfig = changingAdapterType
+        ? (requestedAdapterConfig ?? {})
+        : (requestedAdapterConfig ?? existingAdapterConfig);
       if (requestedAdapterConfig && !changingAdapterType && !replaceAdapterConfig) {
         rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...requestedAdapterConfig };
       }

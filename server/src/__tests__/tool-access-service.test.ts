@@ -4652,6 +4652,10 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(connect.actions.canMakeChanges).toEqual([
       expect.objectContaining({ toolName: "update_zap", riskLevel: "write" }),
     ]);
+    expect(connect.suggestedDefaults).toMatchObject({
+      access: "all_agents",
+      askFirstRiskLevels: [],
+    });
 
     const listEntry = connect.catalog.find((entry) => entry.toolName === "list_zaps")!;
     const updateEntry = connect.catalog.find((entry) => entry.toolName === "update_zap")!;

@@ -2117,6 +2117,7 @@ type ManagedMcpGatewayRunConfig = {
     endpointPath: string;
     bearerToken: string;
     tokenPrefix: string;
+    contextScoped: boolean;
   }>;
 };
 
@@ -2357,7 +2358,22 @@ async function createManagedMcpRunConfig(input: {
     });
     managedGateways.push({
       id: gateway.id,
-      name: gateway.name,
+      // The MCP server name is an executable identifier, not a display label.
+      // Use the stable gateway slug so prompts can address the delivered tools
+      // exactly (for example mcp__support_intake__search_tools) without spaces
+      // being rewritten to hyphens by individual adapters.
+      name: gateway.slug,
+      // Whether this gateway was bound to the run's agent, project or issue, as
+      // opposed to applying to every run of the company. An adapter that has to
+      // narrow a large delivered set must narrow on this, never on the slug: a
+      // name is a label an operator can change, while this is the same scope
+      // gatewayAppliesToRun already filtered on.
+      contextScoped: Boolean(
+        gateway.agentId
+          || gateway.projectId
+          || gateway.issueId
+          || (gateway.contextScopeType && gateway.contextScopeType !== "none"),
+      ),
       endpointPath: `/api/tool-gateway/gateways/${gateway.id}/mcp`,
       bearerToken: token.token,
       tokenPrefix: token.tokenPrefix,
@@ -2994,16 +3010,12 @@ export function shouldResetTaskSessionForWake(
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (
     wakeReason === "issue_assigned" ||
-    wakeReason === "execution_review_requested" ||
     wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON ||
     wakeReason === "execution_approval_requested" ||
-    wakeReason === "execution_changes_requested" ||
     // PF-4: timer-driven wakes are exploratory ("any new work?"). They do not
     // carry meaningful continuation state, so reusing the prior task session
-    // for repeated timer wakes accumulates low-value context and pushes the
-    // session toward the 64k compaction threshold (observed in CEO run
-    // 292a5fd1, where timer wakes repeatedly bloated a long-lived manager
-    // session). Reset on every timer wake so each interval starts fresh.
+    // for repeated timer wakes accumulates low-value context. Reset on every
+    // timer wake so each interval starts fresh.
     wakeReason === "heartbeat_timer"
   ) {
     return true;
@@ -3109,15 +3121,15 @@ export function describeSessionResetReason(
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
-  if (wakeReason === "execution_review_requested") return "wake reason is execution_review_requested";
   if (wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON) {
     return `wake reason is ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON}`;
   }
   if (wakeReason === "execution_approval_requested") return "wake reason is execution_approval_requested";
-  if (wakeReason === "execution_changes_requested") return "wake reason is execution_changes_requested";
   // PF-4: paired with shouldResetTaskSessionForWake — keep the reason wording
   // explicit so run logs make session reuse/reset behavior legible.
-  if (wakeReason === "heartbeat_timer") return "wake reason is heartbeat_timer (timer-driven wake starts fresh)";
+  if (wakeReason === "heartbeat_timer") {
+    return "wake reason is heartbeat_timer (timer-driven wake starts fresh)";
+  }
   return null;
 }
 
@@ -3694,6 +3706,12 @@ function buildSessionConfigCategoryValues(input: {
   agentConfigRevision: unknown;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(input.secretManifest);
+  const workspaceConfig = { ...parseObject(input.workspaceConfig) };
+  // issues.updatedAt also advances for comments and status changes. Those are
+  // wake deltas, not execution-workspace configuration changes, so including
+  // the timestamp here makes every comment invalidate an otherwise reusable
+  // task session.
+  delete workspaceConfig.issueConfigRevisionAt;
   return {
     adapter: {
       adapterType: input.adapterType,
@@ -3704,7 +3722,7 @@ function buildSessionConfigCategoryValues(input: {
     modelProfile: input.modelProfile,
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
-    workspaceConfig: input.workspaceConfig,
+    workspaceConfig,
     environment: input.environment,
     envBindings: {
       environment: { env: input.environmentEnv },
@@ -7592,13 +7610,73 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    taskSessionMutation?:
+      | {
+        kind: "clear";
+        companyId: string;
+        agentId: string;
+        adapterType: string;
+        taskKey: string;
+      }
+      | {
+        kind: "upsert";
+        companyId: string;
+        agentId: string;
+        adapterType: string;
+        taskKey: string;
+        sessionParamsJson: Record<string, unknown> | null;
+        sessionDisplayId: string | null;
+        lastError: string | null;
+      },
   ) {
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const updated = await db.transaction(async (tx) => {
+      const row = await tx
+        .update(heartbeatRuns)
+        .set({ status, ...patch, updatedAt: new Date() })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!row || !taskSessionMutation) return row;
+
+      const sessionIdentity = and(
+        eq(agentTaskSessions.companyId, taskSessionMutation.companyId),
+        eq(agentTaskSessions.agentId, taskSessionMutation.agentId),
+        eq(agentTaskSessions.adapterType, taskSessionMutation.adapterType),
+        eq(agentTaskSessions.taskKey, taskSessionMutation.taskKey),
+      );
+      if (taskSessionMutation.kind === "clear") {
+        await tx.delete(agentTaskSessions).where(sessionIdentity);
+      } else {
+        await tx
+          .insert(agentTaskSessions)
+          .values({
+            companyId: taskSessionMutation.companyId,
+            agentId: taskSessionMutation.agentId,
+            adapterType: taskSessionMutation.adapterType,
+            taskKey: taskSessionMutation.taskKey,
+            sessionParamsJson: taskSessionMutation.sessionParamsJson,
+            sessionDisplayId: taskSessionMutation.sessionDisplayId,
+            lastRunId: row.id,
+            lastError: taskSessionMutation.lastError,
+          })
+          .onConflictDoUpdate({
+            target: [
+              agentTaskSessions.companyId,
+              agentTaskSessions.agentId,
+              agentTaskSessions.adapterType,
+              agentTaskSessions.taskKey,
+            ],
+            set: {
+              sessionParamsJson: taskSessionMutation.sessionParamsJson,
+              sessionDisplayId: taskSessionMutation.sessionDisplayId,
+              lastRunId: row.id,
+              lastError: taskSessionMutation.lastError,
+              updatedAt: new Date(),
+            },
+          });
+      }
+      return row;
+    });
 
     if (updated) {
       if (isHeartbeatRunTerminalStatus(updated.status)) {
@@ -12333,6 +12411,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceConfig: {
         requestedMode: requestedExecutionWorkspaceMode,
         effectiveMode: effectiveExecutionWorkspaceMode,
+        issueProjectId: issueRef?.projectId ?? null,
+        issueProjectWorkspaceId: issueRef?.projectWorkspaceId ?? null,
+        issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
         issueConfigRevisionAt: issueContext?.updatedAt instanceof Date
           ? issueContext.updatedAt.toISOString()
           : issueContext?.updatedAt ?? null,
@@ -13833,21 +13914,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
-      const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
-        finishedAt: new Date(),
-        error: runErrorMessage,
-        errorCode: runErrorCode,
-        exitCode: adapterResult.exitCode,
-        signal: adapterResult.signal,
-        usageJson,
-        resultJson: persistedResultJson,
-        sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
-        stdoutExcerpt,
-        stderrExcerpt,
-        logBytes: logSummary?.bytes,
-        logSha256: logSummary?.sha256,
-        logCompressed: logSummary?.compressed ?? false,
-      });
+      const persistedRunWrite = await setRunStatusIfRunning(
+        run.id,
+        status,
+        {
+          finishedAt: new Date(),
+          error: runErrorMessage,
+          errorCode: runErrorCode,
+          exitCode: adapterResult.exitCode,
+          signal: adapterResult.signal,
+          usageJson,
+          resultJson: persistedResultJson,
+          sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+          stdoutExcerpt,
+          stderrExcerpt,
+          logBytes: logSummary?.bytes,
+          logSha256: logSummary?.sha256,
+          logCompressed: logSummary?.compressed ?? false,
+        },
+        taskKey
+          ? adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)
+            ? {
+              kind: "clear",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+            }
+            : {
+              kind: "upsert",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                nextSessionState.params,
+                configuredModel,
+                sessionConfigMetadata,
+              ),
+              sessionDisplayId: nextSessionState.displayId,
+              lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
+            }
+          : undefined,
+      );
       if (!persistedRunWrite.updated) {
         logger.info(
           {
@@ -13865,12 +13974,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
 
+      // The successful completion and its task-session continuation are
+      // committed atomically above. Any deferred or concurrent wake that can
+      // observe this terminal run can therefore also resume its saved session.
+      const finalizedRun = persistedRun ?? (await getRun(run.id));
+
       await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
         finishedAt: new Date(),
         error: runErrorMessage,
       });
 
-      const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
@@ -13989,29 +14102,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
-        if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
-              taskKey,
-              adapterType: agent.adapterType,
-            });
-          } else {
-            await upsertTaskSession({
-              companyId: agent.companyId,
-              agentId: agent.id,
-              adapterType: agent.adapterType,
-              taskKey,
-              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-                nextSessionState.params,
-                configuredModel,
-                sessionConfigMetadata,
-              ),
-              sessionDisplayId: nextSessionState.displayId,
-              lastRunId: finalizedRun.id,
-              lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
-            });
-          }
-        }
       }
       await finalizeAgentStatus(
         agent.id,
@@ -14055,21 +14145,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
-      const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
-        error: message,
-        errorCode: failureErrorCode,
-        finishedAt: new Date(),
-        resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
+      const failedRunWrite = await setRunStatusIfRunning(
+        run.id,
+        "failed",
+        {
+          error: message,
           errorCode: failureErrorCode,
-          errorMessage: message,
-          resultJson: workspaceValidationFailure?.resultJson ?? configurationIncompleteFailure?.resultJson ?? null,
-        }),
-        stdoutExcerpt,
-        stderrExcerpt,
-        logBytes: logSummary?.bytes,
-        logSha256: logSummary?.sha256,
-        logCompressed: logSummary?.compressed ?? false,
-      });
+          finishedAt: new Date(),
+          resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
+            errorCode: failureErrorCode,
+            errorMessage: message,
+            resultJson: workspaceValidationFailure?.resultJson ?? configurationIncompleteFailure?.resultJson ?? null,
+          }),
+          stdoutExcerpt,
+          stderrExcerpt,
+          logBytes: logSummary?.bytes,
+          logSha256: logSummary?.sha256,
+          logCompressed: logSummary?.compressed ?? false,
+        },
+        taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)
+          ? {
+            kind: "upsert",
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey,
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+              previousSessionParams,
+              configuredModel,
+              sessionConfigMetadata,
+            ),
+            sessionDisplayId: previousSessionDisplayId,
+            lastError: message,
+          }
+          : undefined,
+      );
       if (!failedRunWrite.updated) {
         logger.info(
           {
@@ -14126,22 +14236,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           legacySessionId: runtimeForAdapter.sessionId,
         });
 
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-              previousSessionParams,
-              configuredModel,
-              sessionConfigMetadata,
-            ),
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
-          });
-        }
       }
 
       await finalizeAgentStatus(agent.id, "failed", message);

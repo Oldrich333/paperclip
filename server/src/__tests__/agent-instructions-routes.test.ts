@@ -497,6 +497,54 @@ describe("agent instructions bundle routes", () => {
     );
   });
 
+  it("does not carry an old adapter model into Codex when only the type changes", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterType: "claude_local",
+      adapterConfig: {
+        model: "claude-sonnet-4",
+        modelReasoningEffort: "high",
+        cwd: "/workspace",
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({ adapterType: "codex_local" }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({
+        adapterType: "codex_local",
+        adapterConfig: expect.objectContaining({
+          model: "gpt-5.6-luna",
+          modelReasoningEffort: "xhigh",
+          cwd: "/workspace",
+        }),
+      }),
+      expect.any(Object),
+    );
+    const update = mockAgentService.update.mock.calls.at(-1)?.[1] as { adapterConfig?: Record<string, unknown> };
+    expect(update.adapterConfig?.model).not.toBe("claude-sonnet-4");
+  });
+
+  it("preserves the legacy Codex reasoningEffort alias when applying defaults", async () => {
+    mockAgentService.getById.mockResolvedValue(makeAgent());
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({ adapterConfig: { reasoningEffort: "high" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const update = mockAgentService.update.mock.calls.at(-1)?.[1] as { adapterConfig?: Record<string, unknown> };
+    expect(update.adapterConfig).toEqual(expect.objectContaining({
+      model: "gpt-5.6-luna",
+      reasoningEffort: "high",
+      modelReasoningEffort: "high",
+    }));
+  });
+
   it("merges same-adapter config patches so instructions metadata is not dropped", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),

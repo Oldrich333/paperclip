@@ -9,6 +9,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   budgetPolicies,
   companySecretBindings,
@@ -394,6 +395,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await db.delete(activityLog);
       await db.delete(heartbeatRunEvents);
+      await db.delete(agentTaskSessions);
       try {
         await db.delete(heartbeatRuns);
         break;
@@ -2733,22 +2735,42 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(configurationComment).toBeTruthy();
   });
 
-  it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
+  it("persists the task session before a successful-run handoff wake starts", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
-    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
-      await db.insert(issueComments).values({
-        companyId,
-        issueId,
-        authorAgentId: agentId,
-        createdByRunId: ctx.runId,
-        body: "Implemented the backend detector, but did not choose a final issue state.",
+    const observedRuntimeSessions: Array<{
+      sessionId: string | null | undefined;
+      sessionDisplayId: string | null | undefined;
+    }> = [];
+    mockAdapterExecute.mockImplementation(async (ctx: {
+      runId: string;
+      runtime: { sessionId?: string | null; sessionDisplayId?: string | null };
+    }) => {
+      observedRuntimeSessions.push({
+        sessionId: ctx.runtime.sessionId,
+        sessionDisplayId: ctx.runtime.sessionDisplayId,
       });
+      if (observedRuntimeSessions.length === 1) {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: ctx.runId,
+          body: "Implemented the backend detector, but did not choose a final issue state.",
+        });
+      } else {
+        await db
+          .update(issues)
+          .set({ status: "blocked", updatedAt: new Date() })
+          .where(eq(issues.id, issueId));
+      }
       return {
         exitCode: 0,
         signal: null,
         timedOut: false,
         errorMessage: null,
         summary: "Implemented the backend detector, but did not choose a final issue state.",
+        sessionParams: { sessionId: "handoff-session" },
+        sessionDisplayId: "handoff-session",
         provider: "test",
         model: "test-model",
       };
@@ -2768,6 +2790,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }, 5_000);
     await waitForHeartbeatIdle(db, 5_000);
 
+    expect(observedRuntimeSessions).toHaveLength(2);
+    expect(observedRuntimeSessions[0]).toEqual({
+      sessionId: null,
+      sessionDisplayId: null,
+    });
+    expect(observedRuntimeSessions[1]).toEqual({
+      sessionId: "handoff-session",
+      sessionDisplayId: "handoff-session",
+    });
     expect(handoffWakeups).toHaveLength(1);
     expect(handoffWakeups[0]?.idempotencyKey).toBe(`finish_successful_run_handoff:${issueId}:${runId}:1`);
     expect(handoffWakeups[0]?.payload).toMatchObject({
@@ -2814,6 +2845,84 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
+  });
+
+  it("preserves an explicit resume session atomically when a failed run promotes a deferred wake", async () => {
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_commented",
+          resumeSessionParams: { sessionId: "resume-before-failure" },
+          resumeSessionDisplayId: "resume-before-failure",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    let releaseFirstFailure: (() => void) | null = null;
+    const firstAdapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementation(async (ctx: {
+        runtime: { sessionId?: string | null; sessionDisplayId?: string | null };
+      }) => {
+        observedRuntimeSessions.push({
+          sessionId: ctx.runtime.sessionId,
+          sessionDisplayId: ctx.runtime.sessionDisplayId,
+        });
+        if (observedRuntimeSessions.length === 1) {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseFirstFailure = release;
+          });
+          throw new Error("adapter failed after resuming its explicit session");
+        }
+        await db
+          .update(issues)
+          .set({ status: "blocked", updatedAt: new Date() })
+          .where(eq(issues.id, issueId));
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Deferred continuation resumed after failure.",
+          sessionParams: { sessionId: "resume-before-failure" },
+          sessionDisplayId: "resume-before-failure",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+    const observedRuntimeSessions: Array<{
+      sessionId: string | null | undefined;
+      sessionDisplayId: string | null | undefined;
+    }> = [];
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await firstAdapterStarted;
+    await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, taskId: issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+    });
+    if (!releaseFirstFailure) throw new Error("First adapter failure release handle was not captured");
+    releaseFirstFailure();
+
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForValue(async () => observedRuntimeSessions.length >= 2 ? true : null, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    expect(observedRuntimeSessions).toEqual([
+      { sessionId: "resume-before-failure", sessionDisplayId: "resume-before-failure" },
+      { sessionId: "resume-before-failure", sessionDisplayId: "resume-before-failure" },
+    ]);
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

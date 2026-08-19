@@ -649,7 +649,12 @@ function assertSupportedGenericPolicyShape(
 ) {
   assertGenericPolicyType(policyType);
   assertSupportedPolicyConditions(conditions);
-  if (policyType !== "rate_limit" && hasConfig(config)) {
+  const isAppGalleryProvenanceConfig = policyType === "require_approval"
+    && config?.source === "app_gallery_finish"
+    && typeof config.connectionId === "string"
+    && typeof config.catalogEntryId === "string"
+    && Object.keys(config).length === 3;
+  if (policyType !== "rate_limit" && hasConfig(config) && !isAppGalleryProvenanceConfig) {
     throw unprocessable(`Tool policy type '${policyType}' does not support config`);
   }
   if (policyType === "rate_limit") {

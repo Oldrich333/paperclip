@@ -608,6 +608,36 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(remainingTrustRules.map((policy) => policy.id)).toEqual([trustRule.id]);
   });
 
+  it("allows updating app-gallery approval policies with provenance config", async () => {
+    const company = await createCompany(db);
+    const svc = toolAccessPolicyService(db);
+    const config = {
+      source: "app_gallery_finish",
+      connectionId: randomUUID(),
+      catalogEntryId: randomUUID(),
+    };
+    const [policy] = await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Ask before sending",
+      policyType: "require_approval",
+      selectors: { catalogEntryId: config.catalogEntryId },
+      config,
+    }).returning();
+
+    const updated = await svc.updatePolicy({
+      companyId: company.id,
+      policyId: policy!.id,
+      body: { enabled: false },
+    });
+
+    expect(updated).toMatchObject({ id: policy!.id, enabled: false, config });
+    await expect(svc.updatePolicy({
+      companyId: company.id,
+      policyId: policy!.id,
+      body: { config: { trustRule: { hitCount: 1 } } },
+    })).rejects.toThrow("Tool policy type 'require_approval' does not support config");
+  });
+
   it("treats glob-looking action-name selectors as exact names", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

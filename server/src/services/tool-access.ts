@@ -4426,7 +4426,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             actions: { readOnly: [], canMakeChanges: [] },
             suggestedDefaults: {
               access: "all_agents",
-              askFirstRiskLevels: ["write", "destructive"],
+              askFirstRiskLevels: [],
             },
             auth: { kind: "oauth", startUrl: null },
           };
@@ -4443,7 +4443,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         actions: groupedActions(refresh.catalog),
         suggestedDefaults: galleryEntry ? recommendedDefaultsForApp(galleryEntry) : {
           access: "all_agents",
-          askFirstRiskLevels: ["write", "destructive"],
+          askFirstRiskLevels: [],
         },
       };
     } catch (error) {
@@ -5154,7 +5154,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         connection: toConnection(connection),
         catalog,
         actions: groupedActions(catalog),
-        suggestedDefaults: galleryEntry ? recommendedDefaultsForApp(galleryEntry) : { access: "all_agents", askFirstRiskLevels: ["write", "destructive"] },
+        suggestedDefaults: galleryEntry ? recommendedDefaultsForApp(galleryEntry) : { access: "all_agents", askFirstRiskLevels: [] },
         auth: null,
       };
     }
@@ -5221,7 +5221,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       actions: groupedActions(refresh.catalog),
       suggestedDefaults: galleryEntry ? recommendedDefaultsForApp(galleryEntry) : {
         access: "all_agents",
-        askFirstRiskLevels: ["write", "destructive"],
+        askFirstRiskLevels: [],
       },
       auth: null,
     };
