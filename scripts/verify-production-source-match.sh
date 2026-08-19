@@ -36,10 +36,11 @@ mkdir -p "$workdir/commit" "$workdir/container"
 git -C "$repo_root" archive "$commit" | tar -x -C "$workdir/commit"
 
 # The production Dockerfile copies the repository build context without .github/**.
-# Keep that documented, non-copied path out of the correspondence set; every other
-# tracked path must be present and byte-identical in the running image.
+# The checker itself is host-side verification tooling added after this captured
+# image and is also not part of the application correspondence set. Every other
+# tracked application path must be present and byte-identical in the running image.
 git -C "$repo_root" ls-tree -r -z --name-only "$commit" |
-  awk -v RS='\0' 'index($0, ".github/") != 1 { printf "%s%c", $0, 0 }' > "$workdir/paths"
+  awk -v RS='\0' 'index($0, ".github/") != 1 && $0 != "scripts/verify-production-source-match.sh" { printf "%s%c", $0, 0 }' > "$workdir/paths"
 
 if ! docker inspect --format '{{.State.Running}}' "$container" | grep -qx true; then
   printf 'Container is not running: %s\n' "$container" >&2
@@ -48,7 +49,7 @@ fi
 
 # Transfer only the tracked paths under test. A failed tar read is an unexpected
 # absence and must fail the check rather than being hidden by a partial archive.
-if ! docker exec -i "$container" tar -C /app --null --files-from=- --no-recursion -cf - < "$workdir/paths" |
+if ! docker exec -i "$container" tar -C /app --null --no-recursion --files-from=- -cf - < "$workdir/paths" |
   tar -x -C "$workdir/container"; then
   printf 'Could not extract the tracked production paths from %s.\n' "$container" >&2
   exit 1
@@ -73,7 +74,7 @@ while IFS= read -r -d '' path; do
   fi
 done < "$workdir/paths"
 
-printf 'Checked %d tracked paths; excluded .github/** by Dockerfile copy-set contract.\n' "$checked"
+printf 'Checked %d tracked paths; excluded .github/** and host-side verifier by Dockerfile copy-set contract.\n' "$checked"
 if (( failures != 0 )); then
   printf '%d production source mismatches or unexpected absences.\n' "$failures" >&2
   exit 1
