@@ -2542,6 +2542,13 @@ function normalizeMaxConcurrentRuns(value: unknown) {
   return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_MIN, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
 }
 
+type WakeupReceipt = {
+  id: string;
+  status: string;
+  runId: string | null;
+  coalescedCount: number;
+};
+
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -2551,6 +2558,7 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  onReceipt?: (receipt: WakeupReceipt) => void;
 }
 
 type UsageTotals = {
@@ -18323,23 +18331,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .returning()
               .then((rows) => rows[0] ?? availableActiveExecutionRun);
 
-            await tx.insert(agentWakeupRequests).values({
-              companyId: agent.companyId,
-              agentId,
-              source,
-              triggerDetail,
-              reason: "issue_execution_same_name",
-              payload,
-              status: "coalesced",
-              coalescedCount: 1,
-              requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
-              runId: mergedRun.id,
-              finishedAt: new Date(),
-            });
+            const wakeupRequest = await tx
+              .insert(agentWakeupRequests)
+              .values({
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_execution_same_name",
+                payload,
+                status: "coalesced",
+                coalescedCount: 1,
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                runId: mergedRun.id,
+                finishedAt: new Date(),
+              })
+              .returning({
+                id: agentWakeupRequests.id,
+                status: agentWakeupRequests.status,
+                runId: agentWakeupRequests.runId,
+                coalescedCount: agentWakeupRequests.coalescedCount,
+              })
+              .then((rows) => rows[0]);
 
-            return { kind: "coalesced" as const, run: mergedRun };
+            return { kind: "coalesced" as const, run: mergedRun, request: wakeupRequest };
           }
 
           if (availableActiveExecutionRun) {
@@ -18603,10 +18620,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // doesn't start it). It will be stamped in claimQueuedRun() once the run
         // transitions to "running" — Fix A (lazy locking).
 
-        return { kind: "queued" as const, run: newRun };
+        return {
+          kind: "queued" as const,
+          run: newRun,
+          request: {
+            id: wakeupRequest.id,
+            status: wakeupRequest.status,
+            runId: newRun.id,
+            coalescedCount: wakeupRequest.coalescedCount,
+          },
+        };
       });
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      opts.onReceipt?.(outcome.request);
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
@@ -18673,21 +18700,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .returning()
         .then((rows) => rows[0] ?? coalescedTargetRun);
 
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
+      const wakeupRequest = await db
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: mergedRun.id,
+          finishedAt: new Date(),
+        })
+        .returning({
+          id: agentWakeupRequests.id,
+          status: agentWakeupRequests.status,
+          runId: agentWakeupRequests.runId,
+          coalescedCount: agentWakeupRequests.coalescedCount,
+        })
+        .then((rows) => rows[0]);
+      if (wakeupRequest) opts.onReceipt?.(wakeupRequest);
       return mergedRun;
     }
 
@@ -18773,10 +18810,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-      return { kind: "queued" as const, run: newRun };
+      return {
+        kind: "queued" as const,
+        run: newRun,
+        request: {
+          id: wakeupRequest.id,
+          status: wakeupRequest.status,
+          runId: newRun.id,
+          coalescedCount: wakeupRequest.coalescedCount,
+        },
+      };
     });
 
     if (queueOutcome.kind === "skipped") return null;
+    opts.onReceipt?.(queueOutcome.request);
     const newRun = queueOutcome.run;
 
     publishLiveEvent({
@@ -19346,23 +19393,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     wakeup: trackWakeup,
     wakeupWithReceipt: async (agentId: string, opts: WakeupOptions = {}) => {
       const idempotencyKey = opts.idempotencyKey?.trim() || `wakeup_receipt:${randomUUID()}`;
-      const run = await trackWakeup(agentId, { ...opts, idempotencyKey });
-      const request = await db
-        .select({
-          id: agentWakeupRequests.id,
-          status: agentWakeupRequests.status,
-          runId: agentWakeupRequests.runId,
-          coalescedCount: agentWakeupRequests.coalescedCount,
-        })
-        .from(agentWakeupRequests)
-        .where(and(
-          eq(agentWakeupRequests.agentId, agentId),
-          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-        ))
-        .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.id))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      return { run, request, idempotencyKey };
+      const receiptCapture: { current: WakeupReceipt | null } = { current: null };
+      const run = await trackWakeup(agentId, {
+        ...opts,
+        idempotencyKey,
+        onReceipt: (receipt) => {
+          receiptCapture.current = receipt;
+        },
+      });
+      return { run, request: receiptCapture.current, idempotencyKey };
     },
     triggerIssueMonitor,
 

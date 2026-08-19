@@ -687,6 +687,86 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     );
   });
 
+  it("returns each overlapping same-key wake's own inserted receipt and bound run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Concurrent receipt binding",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    let releaseAdapter!: () => void;
+    const adapterGate = new Promise<void>((resolve) => { releaseAdapter = resolve; });
+    mockAdapterExecute.mockImplementation(async () => {
+      await adapterGate;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Concurrent receipt binding completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const idempotencyKey = "same-user-key";
+
+    try {
+      const firstPromise = heartbeat.wakeupWithReceipt(agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        payload: { issueId },
+        idempotencyKey,
+      });
+      const firstClaimed = await waitForCondition(async () => {
+        const [row] = await db
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        return typeof row?.executionRunId === "string";
+      });
+      expect(firstClaimed).toBe(true);
+
+      const secondPromise = heartbeat.wakeupWithReceipt(agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        payload: { issueId },
+        idempotencyKey,
+      });
+      const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+      expect(first.request).toMatchObject({
+        status: "queued",
+        runId: first.run?.id,
+      });
+      expect(second.request).toMatchObject({
+        status: "coalesced",
+        runId: first.run?.id,
+      });
+      expect(second.run?.id).toBe(first.run?.id);
+      expect(second.request?.id).not.toBe(first.request?.id);
+      const persisted = await db
+        .select({
+          id: agentWakeupRequests.id,
+          status: agentWakeupRequests.status,
+          runId: agentWakeupRequests.runId,
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+      expect(persisted).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: first.request?.id, runId: first.run?.id, idempotencyKey }),
+        expect.objectContaining({ id: second.request?.id, status: "coalesced", runId: first.run?.id, idempotencyKey }),
+      ]));
+    } finally {
+      releaseAdapter();
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
+
   it("skips wakes before queueing when per-agent daily cost cap is reached", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {

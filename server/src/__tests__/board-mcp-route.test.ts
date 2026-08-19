@@ -339,4 +339,76 @@ describe("Board MCP route", () => {
       expect.objectContaining({ action: "board_mcp.run_created" }),
     );
   });
+
+  it("binds concurrent same-key responses and audits to each call's own wakeup receipt", async () => {
+    type WakeResult = {
+      run: { id: string; status: string };
+      request: { id: string; status: string; runId: string; coalescedCount: number };
+      idempotencyKey: string;
+    };
+    let resolveFirst!: (value: WakeResult) => void;
+    let resolveSecond!: (value: WakeResult) => void;
+    const firstWake = new Promise<WakeResult>((resolve) => { resolveFirst = resolve; });
+    const secondWake = new Promise<WakeResult>((resolve) => { resolveSecond = resolve; });
+    mocks.wakeupWithReceipt
+      .mockImplementationOnce(() => firstWake)
+      .mockImplementationOnce(() => secondWake);
+    const app = createApp(boardActor());
+    const args = { companyId, issueId: "issue-1", idempotencyKey: "same-user-key" };
+
+    const firstResponsePromise = callTool(app, "paperclip.board.run.start", args);
+    await vi.waitFor(() => expect(mocks.wakeupWithReceipt).toHaveBeenCalledTimes(1));
+    const secondResponsePromise = callTool(app, "paperclip.board.run.start", args);
+    await vi.waitFor(() => expect(mocks.wakeupWithReceipt).toHaveBeenCalledTimes(2));
+    expect(mocks.wakeupWithReceipt).toHaveBeenNthCalledWith(
+      1,
+      "agent-1",
+      expect.objectContaining({ idempotencyKey: "same-user-key" }),
+    );
+    expect(mocks.wakeupWithReceipt).toHaveBeenNthCalledWith(
+      2,
+      "agent-1",
+      expect.objectContaining({ idempotencyKey: "same-user-key" }),
+    );
+
+    resolveSecond({
+      run: { id: "run-second", status: "running" },
+      request: { id: "wake-second", status: "coalesced", runId: "run-second", coalescedCount: 1 },
+      idempotencyKey: "same-user-key",
+    });
+    const secondResponse = await secondResponsePromise;
+    resolveFirst({
+      run: { id: "run-first", status: "queued" },
+      request: { id: "wake-first", status: "queued", runId: "run-first", coalescedCount: 0 },
+      idempotencyKey: "same-user-key",
+    });
+    const firstResponse = await firstResponsePromise;
+
+    expect(firstResponse.body.result.structuredContent).toMatchObject({
+      outcome: "created",
+      run: { id: "run-first" },
+      wakeupRequest: { id: "wake-first", runId: "run-first" },
+    });
+    expect(secondResponse.body.result.structuredContent).toMatchObject({
+      outcome: "coalesced",
+      run: { id: "run-second" },
+      wakeupRequest: { id: "wake-second", runId: "run-second" },
+    });
+    expect(mocks.logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "board_mcp.run_created",
+        runId: "run-first",
+        details: expect.objectContaining({ wakeupRequestId: "wake-first" }),
+      }),
+    );
+    expect(mocks.logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "board_mcp.run_coalesced",
+        runId: "run-second",
+        details: expect.objectContaining({ wakeupRequestId: "wake-second" }),
+      }),
+    );
+  });
 });
