@@ -196,6 +196,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
   async function latestWakeRequest(agentId: string) {
     return db
       .select({
+        id: agentWakeupRequests.id,
         status: agentWakeupRequests.status,
         reason: agentWakeupRequests.reason,
         payload: agentWakeupRequests.payload,
@@ -213,10 +214,20 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
 
-    const throttledWake = await assignmentWake(agentId, issueId);
-    expect(throttledWake).toBeNull();
+    const throttledWake = await heartbeat.wakeupWithReceipt(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+    });
+    expect(throttledWake.run).toBeNull();
+    expect(throttledWake.request).toMatchObject({ status: "skipped", runId: null });
 
     const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.id).toBe(throttledWake.request?.id);
     expect(skipped?.status).toBe("skipped");
     expect(skipped?.reason).toBe("issue_rewake_throttled");
     const heartbeatSkip = (skipped?.payload as Record<string, unknown> | null)?.heartbeatSkip as

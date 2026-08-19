@@ -17576,20 +17576,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason: skipReason,
-        payload,
-        status: "skipped",
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        finishedAt: new Date(),
-        ...patch,
-      });
+      const request = await db
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason: skipReason,
+          payload,
+          status: "skipped",
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          finishedAt: new Date(),
+          ...patch,
+        })
+        .returning({
+          id: agentWakeupRequests.id,
+          status: agentWakeupRequests.status,
+          runId: agentWakeupRequests.runId,
+          coalescedCount: agentWakeupRequests.coalescedCount,
+        })
+        .then((rows) => rows[0]);
+      if (request) opts.onReceipt?.(request);
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
@@ -17871,24 +17881,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null);
 
         if (!issue) {
-          await tx.insert(agentWakeupRequests).values({
-            companyId: agent.companyId,
-            agentId,
-            source,
-            triggerDetail,
-            reason: "issue_execution_issue_not_found",
-            payload,
-            status: "skipped",
-            requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
-            finishedAt: new Date(),
-          });
-          return { kind: "skipped" as const };
+          const request = await tx
+            .insert(agentWakeupRequests)
+            .values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_execution_issue_not_found",
+              payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            })
+            .returning({
+              id: agentWakeupRequests.id,
+              status: agentWakeupRequests.status,
+              runId: agentWakeupRequests.runId,
+              coalescedCount: agentWakeupRequests.coalescedCount,
+            })
+            .then((rows) => rows[0]);
+          return { kind: "skipped" as const, request };
         }
 
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
-          await tx.insert(agentWakeupRequests).values({
+          const request = await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,
             source,
@@ -17907,8 +17926,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
-          });
-          return { kind: "skipped" as const };
+          }).returning({
+            id: agentWakeupRequests.id,
+            status: agentWakeupRequests.status,
+            runId: agentWakeupRequests.runId,
+            coalescedCount: agentWakeupRequests.coalescedCount,
+          }).then((rows) => rows[0]);
+          return { kind: "skipped" as const, request };
         }
 
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
@@ -18147,7 +18171,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
-          await tx.insert(agentWakeupRequests).values({
+          const request = await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,
             source,
@@ -18163,8 +18187,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
-          });
-          return { kind: "skipped" as const };
+          }).returning({
+            id: agentWakeupRequests.id,
+            status: agentWakeupRequests.status,
+            runId: agentWakeupRequests.runId,
+            coalescedCount: agentWakeupRequests.coalescedCount,
+          }).then((rows) => rows[0]);
+          return { kind: "skipped" as const, request };
         }
 
         if (isolatedWorkspacesEnabled && !activeExecutionRun && issue.status !== "done" && issue.status !== "cancelled") {
@@ -18240,7 +18269,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               createdAt: now,
               updatedAt: now,
             });
-            await tx.insert(agentWakeupRequests).values({
+            const request = await tx.insert(agentWakeupRequests).values({
               companyId: agent.companyId,
               agentId,
               source,
@@ -18260,7 +18289,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
-            });
+            }).returning({
+              id: agentWakeupRequests.id,
+              status: agentWakeupRequests.status,
+              runId: agentWakeupRequests.runId,
+              coalescedCount: agentWakeupRequests.coalescedCount,
+            }).then((rows) => rows[0]);
             await logActivity(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "system",
@@ -18282,7 +18316,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 hasResolvablePriorSessionWorkspace,
               },
             });
-            return { kind: "skipped" as const };
+            return { kind: "skipped" as const, request };
           }
         }
 
@@ -18395,32 +18429,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
               };
 
-              await tx
+              const request = await tx
                 .update(agentWakeupRequests)
                 .set({
                   payload: mergedDeferredPayload,
                   coalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
                   updatedAt: new Date(),
                 })
-                .where(eq(agentWakeupRequests.id, existingDeferred.id));
+                .where(eq(agentWakeupRequests.id, existingDeferred.id))
+                .returning({
+                  id: agentWakeupRequests.id,
+                  status: agentWakeupRequests.status,
+                  runId: agentWakeupRequests.runId,
+                  coalescedCount: agentWakeupRequests.coalescedCount,
+                })
+                .then((rows) => rows[0]);
 
-              return { kind: "deferred" as const };
+              return { kind: "deferred" as const, request };
             }
 
-            await tx.insert(agentWakeupRequests).values({
-              companyId: agent.companyId,
-              agentId,
-              source,
-              triggerDetail,
-              reason: "issue_execution_deferred",
-              payload: deferredPayload,
-              status: "deferred_issue_execution",
-              requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
-            });
+            const request = await tx
+              .insert(agentWakeupRequests)
+              .values({
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_execution_deferred",
+                payload: deferredPayload,
+                status: "deferred_issue_execution",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+              })
+              .returning({
+                id: agentWakeupRequests.id,
+                status: agentWakeupRequests.status,
+                runId: agentWakeupRequests.runId,
+                coalescedCount: agentWakeupRequests.coalescedCount,
+              })
+              .then((rows) => rows[0]);
 
-            return { kind: "deferred" as const };
+            return { kind: "deferred" as const, request };
           }
         }
 
@@ -18510,7 +18560,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
 
             if (throttleDecision.blocked) {
-              await tx.insert(agentWakeupRequests).values({
+              const request = await tx.insert(agentWakeupRequests).values({
                 companyId: agent.companyId,
                 agentId,
                 source,
@@ -18533,8 +18583,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
                 finishedAt: throttleNow,
-              });
-              return { kind: "skipped" as const };
+              }).returning({
+                id: agentWakeupRequests.id,
+                status: agentWakeupRequests.status,
+                runId: agentWakeupRequests.runId,
+                coalescedCount: agentWakeupRequests.coalescedCount,
+              }).then((rows) => rows[0]);
+              return { kind: "skipped" as const, request };
             }
           }
         }
@@ -18542,7 +18597,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
         if (dailyCapBlock) {
           const now = new Date();
-          await tx.insert(agentWakeupRequests).values({
+          const request = await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,
             source,
@@ -18561,7 +18616,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: now,
-          });
+          }).returning({
+            id: agentWakeupRequests.id,
+            status: agentWakeupRequests.status,
+            runId: agentWakeupRequests.runId,
+            coalescedCount: agentWakeupRequests.coalescedCount,
+          }).then((rows) => rows[0]);
           if (source === "timer") {
             await tx
               .update(agents)
@@ -18571,7 +18631,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               })
               .where(eq(agents.id, agentId));
           }
-          return { kind: "skipped" as const };
+          return { kind: "skipped" as const, request };
         }
 
         const wakeupRequest = await tx
@@ -18632,7 +18692,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       });
 
-      if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      if (outcome.kind === "deferred" || outcome.kind === "skipped") {
+        if (outcome.request) opts.onReceipt?.(outcome.request);
+        return null;
+      }
       opts.onReceipt?.(outcome.request);
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
@@ -18736,7 +18799,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
         const now = new Date();
-        await tx.insert(agentWakeupRequests).values({
+        const request = await tx.insert(agentWakeupRequests).values({
           companyId: agent.companyId,
           agentId,
           source,
@@ -18755,7 +18818,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: opts.requestedByActorId ?? null,
           idempotencyKey: opts.idempotencyKey ?? null,
           finishedAt: now,
-        });
+        }).returning({
+          id: agentWakeupRequests.id,
+          status: agentWakeupRequests.status,
+          runId: agentWakeupRequests.runId,
+          coalescedCount: agentWakeupRequests.coalescedCount,
+        }).then((rows) => rows[0]);
         if (source === "timer") {
           await tx
             .update(agents)
@@ -18765,7 +18833,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agents.id, agentId));
         }
-        return { kind: "skipped" as const };
+        return { kind: "skipped" as const, request };
       }
 
       const wakeupRequest = await tx
@@ -18822,7 +18890,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     });
 
-    if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind === "skipped") {
+      if (queueOutcome.request) opts.onReceipt?.(queueOutcome.request);
+      return null;
+    }
     opts.onReceipt?.(queueOutcome.request);
     const newRun = queueOutcome.run;
 

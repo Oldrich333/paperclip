@@ -962,7 +962,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     });
 
     const heartbeat = heartbeatService(db);
-    const run = await heartbeat.wakeup(agentId, {
+    const result = await heartbeat.wakeupWithReceipt(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
@@ -970,7 +970,8 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       contextSnapshot: { issueId, wakeReason: "issue_assigned" },
     });
 
-    expect(run).toBeNull();
+    expect(result.run).toBeNull();
+    expect(result.request).toMatchObject({ status: "skipped", runId: null });
     expect(adapterExecute).not.toHaveBeenCalled();
 
     const runRows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
@@ -995,6 +996,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
 
     const wakeup = await db
       .select({
+        id: agentWakeupRequests.id,
         status: agentWakeupRequests.status,
         reason: agentWakeupRequests.reason,
         payload: agentWakeupRequests.payload,
@@ -1003,6 +1005,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       .where(eq(agentWakeupRequests.agentId, agentId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup).toMatchObject({
+      id: result.request?.id,
       status: "skipped",
       reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
     });

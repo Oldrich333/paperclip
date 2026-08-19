@@ -490,16 +490,18 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       contextSnapshot: {},
     });
 
-    const run = await heartbeat.wakeup(agentId, {
+    const result = await heartbeat.wakeupWithReceipt(agentId, {
       source: "on_demand",
       triggerDetail: "manual",
     });
 
-    expect(run).toBeNull();
+    expect(result.run).toBeNull();
+    expect(result.request).toMatchObject({ status: "skipped", runId: null });
     expect(mockAdapterExecute).not.toHaveBeenCalled();
 
     const [wakeup] = await db
       .select({
+        id: agentWakeupRequests.id,
         status: agentWakeupRequests.status,
         reason: agentWakeupRequests.reason,
         payload: agentWakeupRequests.payload,
@@ -508,6 +510,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .where(eq(agentWakeupRequests.agentId, agentId));
 
     expect(wakeup).toMatchObject({
+      id: result.request?.id,
       status: "skipped",
       reason: "heartbeat.daily_run_limit",
     });
@@ -737,6 +740,13 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         idempotencyKey,
       });
       const [first, second] = await Promise.all([firstPromise, secondPromise]);
+      const deferred = await heartbeat.wakeupWithReceipt(agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        payload: { issueId },
+        contextSnapshot: { issueId, forceFreshSession: true },
+        idempotencyKey,
+      });
 
       expect(first.request).toMatchObject({
         status: "queued",
@@ -748,6 +758,13 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       });
       expect(second.run?.id).toBe(first.run?.id);
       expect(second.request?.id).not.toBe(first.request?.id);
+      expect(deferred.run).toBeNull();
+      expect(deferred.request).toMatchObject({
+        status: "deferred_issue_execution",
+        runId: null,
+      });
+      expect(deferred.request?.id).not.toBe(first.request?.id);
+      expect(deferred.request?.id).not.toBe(second.request?.id);
       const persisted = await db
         .select({
           id: agentWakeupRequests.id,
@@ -760,6 +777,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(persisted).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: first.request?.id, runId: first.run?.id, idempotencyKey }),
         expect.objectContaining({ id: second.request?.id, status: "coalesced", runId: first.run?.id, idempotencyKey }),
+        expect.objectContaining({ id: deferred.request?.id, status: "deferred_issue_execution", runId: null, idempotencyKey }),
       ]));
     } finally {
       releaseAdapter();

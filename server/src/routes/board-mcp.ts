@@ -505,8 +505,38 @@ export function boardMcpRoutes(
               runStatus: run.status,
             },
           });
+        } else if (!run && wakeupRequest) {
+          const deferred = wakeupRequest.status === "deferred_issue_execution";
+          await logActivity(db, {
+            companyId,
+            actorType: "user",
+            actorId: actor.actorId,
+            agentId: issue.assigneeAgentId,
+            runId: null,
+            action: deferred ? "board_mcp.run_deferred" : "board_mcp.run_skipped",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              resumeFromRunId,
+              source: "board_mcp",
+              requestedAction: isResume ? "resume" : "start",
+              wakeupRequestId: wakeupRequest.id,
+              wakeupRequestStatus: wakeupRequest.status,
+            },
+          });
         }
-        const outcome = coalesced ? "coalesced" : created ? "created" : run ? "unknown" : "skipped";
+        const outcome = coalesced
+          ? "coalesced"
+          : created
+            ? "created"
+            : run
+              ? "unknown"
+              : wakeupRequest?.status === "deferred_issue_execution"
+                ? "deferred"
+                : wakeupRequest?.status === "skipped"
+                  ? "skipped"
+                  : "unknown";
         return {
           issueId: issue.id,
           agentId: issue.assigneeAgentId,

@@ -255,8 +255,56 @@ describe("Board MCP route", () => {
       run: null,
       status: "skipped",
       outcome: "skipped",
+      wakeupRequest: { id: "wake-skipped", status: "skipped" },
     });
-    expect(mocks.logActivity).not.toHaveBeenCalled();
+    expect(mocks.logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "board_mcp.run_skipped",
+        runId: null,
+        details: expect.objectContaining({
+          wakeupRequestId: "wake-skipped",
+          wakeupRequestStatus: "skipped",
+        }),
+      }),
+    );
+  });
+
+  it("returns and audits a durable deferred wakeup distinctly from skipped", async () => {
+    mocks.wakeupWithReceipt.mockResolvedValue({
+      run: null,
+      request: {
+        id: "wake-deferred",
+        status: "deferred_issue_execution",
+        runId: null,
+        coalescedCount: 0,
+      },
+      idempotencyKey: "receipt-deferred",
+    });
+
+    const response = await callTool(createApp(boardActor()), "paperclip.board.run.start", {
+      companyId,
+      issueId: "issue-1",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.result.structuredContent).toMatchObject({
+      outcome: "deferred",
+      status: "deferred_issue_execution",
+      run: null,
+      wakeupRequest: { id: "wake-deferred", status: "deferred_issue_execution" },
+    });
+    expect(mocks.logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "board_mcp.run_deferred",
+        runId: null,
+        details: expect.objectContaining({
+          wakeupRequestId: "wake-deferred",
+          wakeupRequestStatus: "deferred_issue_execution",
+        }),
+      }),
+    );
   });
 
   it("audits a newly created durable run using its actual queued status", async () => {
