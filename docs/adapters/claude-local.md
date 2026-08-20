@@ -25,6 +25,46 @@ The `claude_local` adapter runs Anthropic's Claude Code CLI locally. It supports
 | `maxTurnsPerRun` | number | No | Max agentic turns per heartbeat (defaults to `300`) |
 | `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); required for headless runs where interactive approval is impossible |
 
+## Multiple subscription accounts
+
+One Paperclip instance can distribute `claude_local` agents across multiple
+Claude Code subscription accounts. Each account must have its own
+`CLAUDE_CONFIG_DIR`. The directory contains that account's Claude login and
+session state; it is a profile selector, not a credential copied into
+Paperclip.
+
+Use a separate parent directory for every profile so Claude's adjacent
+`.claude.json` state is isolated too. For example:
+
+```sh
+install -d -m 700 /srv/paperclip/claude-profiles/account-a/.claude
+install -d -m 700 /srv/paperclip/claude-profiles/account-b/.claude
+
+CLAUDE_CONFIG_DIR=/srv/paperclip/claude-profiles/account-a/.claude claude login
+CLAUDE_CONFIG_DIR=/srv/paperclip/claude-profiles/account-b/.claude claude login
+```
+
+Create one named Paperclip environment per account, set its environment value
+`CLAUDE_CONFIG_DIR` to the matching path, and select that environment for each
+agent. An agent-level `env.CLAUDE_CONFIG_DIR` remains available when an
+environment is unnecessary and takes precedence over the environment value.
+Agents that do not select a profile keep the existing shared/default Claude
+login. Use absolute profile paths. Paperclip normalizes a relative local path
+against its own process working directory before it starts Claude, so agent
+workspace changes cannot switch the selected account.
+
+Paperclip persists the effective profile selection with each Claude CLI
+session. Moving an agent to another profile starts a fresh Claude session; it
+never resumes a conversation created under another subscription account. The
+poisoned-session maintenance command uses the persisted directory for each
+session, so cleanup remains correct when one instance has multiple profiles.
+An older session that predates profile persistence starts fresh the first time
+an explicit profile is selected.
+
+Automatic quota failover is not part of profile selection. Reassign an agent to
+another profile deliberately; the new account starts a fresh session while the
+old session remains associated with its original profile.
+
 ## Prompt Templates
 
 Templates support `{{variable}}` substitution:

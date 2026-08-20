@@ -1,0 +1,1 @@
+ALTER TABLE "tool_invocations" ADD COLUMN "result_payload" jsonb;

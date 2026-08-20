@@ -549,11 +549,13 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(prompt).toContain("Paperclip API access note:");
     expect(prompt).toContain('PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"; PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"');
     expect(prompt).toContain("$PAPERCLIP_API_BASE/api/agents/me");
-    expect(prompt).toContain("$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID");
+    expect(prompt).toContain('scripts/paperclip-issue-update.sh --issue-id "$PAPERCLIP_TASK_ID" --post-comment');
+    expect(prompt).toContain("PAPERCLIP_RUN_SCRATCH_DIR");
     expect(prompt).toContain("X-Paperclip-Run-Id");
     expect(prompt).not.toContain("$PAPERCLIP_API_URL/api/");
     expect(prompt).not.toContain("/api/issues/{id}");
     expect(prompt).not.toContain("-d '{...}'");
+    expect(prompt).toContain("do not create a payload file in the current directory or repository root");
     expect(prompt).not.toContain("runtime-secret-token");
     expect(promptMetrics?.runtimeNoteChars).toBeGreaterThan(0);
   });
@@ -566,6 +568,8 @@ describe("shared ACPX engine runtime behavior", () => {
 
     const prompt = String(meta[0]?.prompt ?? "");
     expect(prompt).toContain("Paperclip API access note:");
+    expect(prompt).toContain("scripts/paperclip-issue-update.sh --issue-id <real-id> --post-comment");
+    expect(prompt).toContain("PAPERCLIP_RUN_SCRATCH_DIR");
     expect(prompt).toContain("Use a real issue id from the current context before making issue write requests.");
     expect(prompt).not.toContain("$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID");
   });
@@ -977,6 +981,66 @@ describe("shared ACPX engine runtime behavior", () => {
     // A new heartbeat with the same config env keeps the fingerprint stable, so
     // per-wake PAPERCLIP_* churn does not needlessly reset the session.
     expect(fp(sameEnvNewWake)).toBe(fp(first));
+  });
+
+  it("forwards per-run scratch env without rotating the ACPX session fingerprint", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const firstScratch = path.join(root, "paperclip-run-1");
+    const secondScratch = path.join(root, "paperclip-run-2");
+    const scratchEnv = (dir: string) => ({
+      PAPERCLIP_RUN_SCRATCH_DIR: dir,
+      PAPERCLIP_TASK_SCRATCH_DIR: dir,
+      PAPERCLIP_SCRATCH_DIR: dir,
+      PAPERCLIP_TMPDIR: dir,
+      TMPDIR: dir,
+      TEMP: dir,
+      TMP: dir,
+    });
+    const scratchContext = (dir: string) => ({
+      taskId: "issue-1",
+      paperclipScratch: {
+        type: "heartbeat_run",
+        dir,
+        tempKeysApplied: ["TMPDIR", "TEMP", "TMP"],
+      },
+    });
+
+    const first = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: scratchEnv(firstScratch) },
+      { context: scratchContext(firstScratch) },
+    );
+    const second = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: scratchEnv(secondScratch) },
+      { context: scratchContext(secondScratch) },
+    );
+    const firstParams = first.result.sessionParams as { configFingerprint?: string; sessionKey?: string };
+    const secondParams = second.result.sessionParams as { configFingerprint?: string; sessionKey?: string };
+    const firstEnv = (first.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+    const secondEnv = (second.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+
+    expect(firstEnv.TMPDIR).toBe(firstScratch);
+    expect(secondEnv.TMPDIR).toBe(secondScratch);
+    expect(secondParams.configFingerprint).toBe(firstParams.configFingerprint);
+    expect(secondParams.sessionKey).toBe(firstParams.sessionKey);
+  });
+
+  it("still rotates the ACPX fingerprint for a user-configured TMPDIR", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const first = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: { TMPDIR: path.join(root, "configured-1") } },
+      { context: { taskId: "issue-1" } },
+    );
+    const second = await runExecutor(
+      { agentCommand: "node ./fake-acp.js", stateDir, env: { TMPDIR: path.join(root, "configured-2") } },
+      { context: { taskId: "issue-1" } },
+    );
+    const fp = (result: { result: { sessionParams?: unknown } }) =>
+      (result.result.sessionParams as { configFingerprint?: string } | undefined)?.configFingerprint;
+
+    expect(fp(first)).toBeDefined();
+    expect(fp(second)).not.toBe(fp(first));
   });
 
   it("busts the session fingerprint when a stable configured PAPERCLIP_* value rotates", async () => {

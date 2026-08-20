@@ -30,6 +30,7 @@ import {
   type PreparedAdapterExecutionTargetRuntime,
   type SandboxAdditionalSource,
 } from "@paperclipai/adapter-utils/execution-target";
+import { buildMcpToolGrants } from "../mcp-tool-grants.js";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   applyPaperclipWorkspaceEnv,
@@ -160,6 +161,7 @@ export interface RuntimeCacheEntry {
   childStderrState: ChildStderrState;
   processIdentitySink: AcpxProcessIdentitySink;
   fingerprint: string;
+  processEnvHash: string;
   lastUsedAt: number;
   cleanupTimer?: NodeJS.Timeout;
 }
@@ -375,6 +377,13 @@ interface AcpxPreparedRuntime {
   timeoutResolution: AdapterExecutionTargetTimeoutResolution;
   sessionKey: string;
   fingerprint: string;
+  // The env basis used to decide whether a resumed ACP child process needs to
+  // restart to pick up new env: the same stable adapter/user-configured env as
+  // `adapterEnvHash`, plus the current run's scratch-dir value. Deliberately
+  // excludes per-wake PAPERCLIP_* identity fields (run id, wake/approval ids,
+  // wake payload, API token) that legitimately change every heartbeat and must
+  // not force a process restart of an otherwise-resumable session.
+  processEnvBasis: Record<string, string>;
   agentCommand: string | null;
   agentRegistry: AcpAgentRegistry;
   processSessionBridge: AdapterExecutionTargetProcessSessionBridgeHandle | null;
@@ -1236,6 +1245,7 @@ async function writePaperclipClaudeSettings(input: {
   stateDir: string;
   agentHome: string;
   companyId: string;
+  mcpServerNames: readonly string[];
 }): Promise<PaperclipClaudeSettingsResult> {
   const filePath = path.join(input.cwd, ".claude", "settings.local.json");
   const instanceRoot = defaultPaperclipInstanceDir();
@@ -1251,6 +1261,12 @@ async function writePaperclipClaudeSettings(input: {
     "Bash(env)",
     `Bash(${input.cwd}/scripts/paperclip-issue-update.sh:*)`,
     `Bash(${input.cwd}/scripts/paperclip:*)`,
+    // Attached runtime gateways must be permitted as well as available. This is
+    // masked today by acpx `approve-all`, but the settings file is what applies
+    // once a stricter permission mode is used, so the two layers are kept in
+    // agreement here rather than relying on the bypass. See the equivalent
+    // reasoning in `packages/adapters/claude-local/src/server/permissions.ts`.
+    ...buildMcpToolGrants(input.mcpServerNames),
   ]);
 
   let existing: Record<string, unknown> = {};
@@ -1575,6 +1591,18 @@ async function buildRuntime(input: {
   // `env` above and are never present in shapedEnvConfig, so they inherently
   // stay out of the hash and don't reset the session every heartbeat.
   const resolvedAdapterEnv: Record<string, string> = {};
+  const paperclipScratch = parseObject(context.paperclipScratch);
+  const paperclipScratchDir = asString(paperclipScratch.dir, "").trim();
+  const paperclipScratchTempKeys = new Set(
+    (Array.isArray(paperclipScratch.tempKeysApplied) ? paperclipScratch.tempKeysApplied : [])
+      .filter((value): value is string => typeof value === "string"),
+  );
+  const paperclipScratchKeys = new Set([
+    "PAPERCLIP_RUN_SCRATCH_DIR",
+    "PAPERCLIP_TASK_SCRATCH_DIR",
+    "PAPERCLIP_SCRATCH_DIR",
+    "PAPERCLIP_TMPDIR",
+  ]);
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value !== "string") continue;
     // Runtime PAPERCLIP_* always wins over config: skip a PAPERCLIP_* key that
@@ -1585,7 +1613,17 @@ async function buildRuntime(input: {
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;
-    resolvedAdapterEnv[key] = value;
+    const isRunScratchEnv =
+      paperclipScratchDir.length > 0 &&
+      value === paperclipScratchDir &&
+      (paperclipScratchKeys.has(key) || paperclipScratchTempKeys.has(key));
+    // The heartbeat harness injects a new scratch directory for every local run.
+    // It must reach the child process, but it is execution-scoped transport rather
+    // than adapter configuration. Hashing it would reject every saved ACP session
+    // before the provider receives session/resume. Match both key and the attested
+    // scratch value so a real user-configured TMPDIR/TEMP/TMP change still busts
+    // the fingerprint.
+    if (!isRunScratchEnv) resolvedAdapterEnv[key] = value;
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
@@ -1632,6 +1670,9 @@ async function buildRuntime(input: {
       stateDir,
       agentHome,
       companyId: agent.companyId,
+      // The same servers handed to the client as `mcpServers`, so permission
+      // cannot drift from availability.
+      mcpServerNames: runtimeMcpServers.map((server) => server.name),
     });
     skillCommandNotes.push(
       `Wrote Paperclip-managed Claude settings to ${paperclipClaudeSettings.filePath} (defaultMode=${paperclipClaudeSettings.defaultMode}${
@@ -2099,6 +2140,7 @@ async function buildRuntime(input: {
     timeoutResolution,
     sessionKey,
     fingerprint,
+    processEnvBasis: { ...resolvedAdapterEnv, __scratchDir: paperclipScratchDir },
     agentCommand,
     agentRegistry,
     processSessionBridge,
@@ -2265,11 +2307,19 @@ function renderApiAccessNote(env: Record<string, string>): string {
   ];
   if (env.PAPERCLIP_TASK_ID) {
     lines.push(
-      "Scoped issue comment example:",
-      `  curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "Content-Type: application/json" -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" -d '{"body":"Status update from agent."}' "$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID/comments"`,
+      "For multiline issue comments, use the checked-in helper so the body stays in memory:",
+      `  scripts/paperclip-issue-update.sh --issue-id "$PAPERCLIP_TASK_ID" --post-comment <<'MD'`,
+      "  Write the comment here; do not create a payload file in the current directory or repository root.",
+      "  MD",
+      "The helper supplies X-Paperclip-Run-Id, preserves failure responses, and uses PAPERCLIP_RUN_SCRATCH_DIR for temporary transport files.",
+      "Payload files for any other request belong under PAPERCLIP_RUN_SCRATCH_DIR, never in the checkout cwd or repository root.",
     );
   } else {
-    lines.push("Use a real issue id from the current context before making issue write requests.");
+    lines.push(
+      "For multiline issue comments, use scripts/paperclip-issue-update.sh --issue-id <real-id> --post-comment with a real issue id from the current context.",
+      "Do not create a payload file in the current directory or repository root; payload files belong under PAPERCLIP_RUN_SCRATCH_DIR.",
+      "Use a real issue id from the current context before making issue write requests.",
+    );
   }
   return lines.join("\n");
 }
@@ -3268,7 +3318,26 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const previousParams = parseObject(ctx.runtime.sessionParams);
       const canResume = isCompatibleSession(previousParams, prepared);
       const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
-      const cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+      // Hash the churn-free basis (adapter config + current scratch dir), NOT
+      // prepared.env: prepared.env also carries per-wake PAPERCLIP_* identity
+      // fields (run id, wake/approval ids, wake payload, API token) that differ
+      // on every heartbeat, which would otherwise rotate the process every time.
+      const processEnvHash = shortHash(prepared.processEnvBasis);
+      let cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+      if (cached && cached.processEnvHash !== processEnvHash) {
+        // The provider session fingerprint intentionally ignores run-scoped env so
+        // model context survives heartbeats. The ACP child process cannot refresh
+        // sessionOptions.env in place, though, so rotate only that process whenever
+        // its complete env changes; close() preserves the provider session that the
+        // fresh process resumes below with the new run id, JWT, and scratch paths.
+        await closeWarmHandle({
+          handles: warmHandles,
+          key: prepared.sessionKey,
+          entry: cached,
+          reason: "paperclip per-run environment refresh",
+        });
+        cached = undefined;
+      }
       const childStderrState = cached?.childStderrState ?? { logPath: null, pendingLiveLine: "" };
       const processIdentitySink = cached?.processIdentitySink ?? {
         current: ctx.onSpawn,
@@ -3654,6 +3723,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               childStderrState,
               processIdentitySink,
               fingerprint: prepared.fingerprint,
+              processEnvHash,
               lastUsedAt: now(),
             };
             warmHandles.set(prepared.sessionKey, entry);

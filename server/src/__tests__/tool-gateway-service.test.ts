@@ -324,6 +324,48 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(consumed.status).toBe("executed");
   });
 
+  it("returns the full stored result on replay, not the 4000-char-truncated summary", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review large echoes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:echo" },
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    // summarizeToolValue truncates its stored summary at 4000 characters, so a
+    // result whose serialized JSON is longer than that is the case where a
+    // summary-only retrieval path would return a corrupted/truncated value.
+    const largeMessage = "x".repeat(4500);
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:echo",
+      parameters: { message: largeMessage },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    });
+
+    const replayed = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:echo",
+      parameters: { message: largeMessage },
+    });
+    expect(replayed.status).toBe("replayed");
+    expect((replayed.result as { content?: string }).content).toBe(largeMessage);
+  });
+
   it("refuses to approve an action request through a different interaction", async () => {
     const { company, agent, issue, run } = await createRunFixture(db);
     await db.insert(toolPolicies).values({

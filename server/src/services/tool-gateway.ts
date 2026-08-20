@@ -86,6 +86,7 @@ const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
+const MAX_STORED_TOOL_RESULT_BYTES = MAX_REMOTE_MCP_RESPONSE_BYTES;
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -458,6 +459,17 @@ function summarizeResult(result: unknown): Record<string, unknown> {
     hasData: record.data !== undefined,
     hasError: Boolean(record.error),
   };
+}
+
+function completeStoredToolResult(validation: ReturnType<typeof validateToolContent>): unknown {
+  if ((validation.summary.sizeBytes ?? 0) > MAX_STORED_TOOL_RESULT_BYTES) {
+    throw new ToolContentValidationError(
+      `Tool result exceeds the ${MAX_STORED_TOOL_RESULT_BYTES}-byte durable result limit`,
+      "tool_result_too_large",
+      ["result_too_large"],
+    );
+  }
+  return validation.value;
 }
 
 function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
@@ -1832,13 +1844,46 @@ export function createToolGatewayService(
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
-    const tool = [...allTools(), ...connectedTools, ...virtualTools]
-      .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
-      .find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found`, "tool_not_found", { tool: toolName });
-    }
-    return tool;
+    const candidates = [...allTools(), ...connectedTools, ...virtualTools]
+      .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"));
+    const exact = candidates.find((candidate) => candidate.name === toolName);
+    if (exact) return exact;
+
+    const upstreamMatches = candidates.filter((candidate) => {
+      const metadata = asRecord(candidate.providerMetadata);
+      return candidate.upstreamToolName === toolName || metadata?.catalogName === toolName;
+    });
+    if (upstreamMatches.length === 1) return upstreamMatches[0]!;
+
+    const tokenize = (value: string) => value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const fieldsFor = (candidate: ToolGatewayDescriptor) => [
+      candidate.name,
+      candidate.upstreamToolName,
+      candidate.displayName,
+      candidate.description,
+      candidate.applicationKey,
+      asRecord(candidate.providerMetadata)?.catalogName,
+    ].filter((value): value is string => typeof value === "string");
+    const requestedTokens = tokenize(toolName);
+    const suggestions = requestedTokens.length === 0 ? [] : candidates
+      .filter(isOnDemandRemoteTool)
+      .map((candidate) => {
+        const candidateTokens = new Set(fieldsFor(candidate).flatMap(tokenize));
+        const score = requestedTokens.reduce(
+          (total, token) => total + ([...candidateTokens].some((candidateToken) => candidateToken.includes(token)) ? 1 : 0),
+          0,
+        );
+        return { candidate, score };
+      })
+      .filter(({ score }) => score > 0)
+      .sort((left, right) => right.score - left.score || left.candidate.name.localeCompare(right.candidate.name))
+      .slice(0, 5)
+      .map(({ candidate }) => candidate.name);
+    const suggestionText = suggestions.length > 0 ? `; nearest candidates: ${suggestions.join(", ")}` : "";
+    throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found${suggestionText}`, "tool_not_found", {
+      tool: toolName,
+      suggestions,
+    });
   }
 
   function virtualRunToolInput(parameters: unknown): { targetToolName: string; targetParameters: unknown } {
@@ -1867,18 +1912,20 @@ export function createToolGatewayService(
   async function executeVirtualSearchTools(session: ToolGatewaySession, parameters: unknown) {
     const params = asRecord(parameters) ?? {};
     const query = typeof params.query === "string" ? params.query.trim().toLowerCase() : "";
+    const queryTokens = query.split(/[^a-z0-9]+/).filter(Boolean);
     const limit = Math.max(1, Math.min(50, Number(params.limit ?? 10) || 10));
     const tools = (await searchableOnDemandTools(session))
       .filter((tool) => {
-        if (!query) return true;
-        return [
+        if (queryTokens.length === 0) return true;
+        const candidateTokens = new Set([
           tool.name,
           tool.displayName,
           tool.description,
           tool.applicationKey,
           tool.upstreamToolName,
-        ].filter((value): value is string => typeof value === "string")
-          .some((value) => value.toLowerCase().includes(query));
+          asRecord(tool.providerMetadata)?.catalogName,
+        ].filter((value): value is string => typeof value === "string").flatMap((value) => value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)));
+        return queryTokens.every((queryToken) => [...candidateTokens].some((candidateToken) => candidateToken.includes(queryToken)));
       })
       .slice(0, limit)
       .map((tool) => ({
@@ -3780,12 +3827,14 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const resultPayload = completeStoredToolResult(resultValidation);
       await db
         .update(toolInvocations)
         .set({
           status: "succeeded",
           resultHash: resultValidation.summary.sha256 ?? null,
           resultSummary: resultValidation.summary,
+          resultPayload,
           resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
           completedAt: new Date(),
           updatedAt: new Date(),
@@ -4016,6 +4065,7 @@ export function createToolGatewayService(
   }
 
   function storedInvocationResult(invocation: typeof toolInvocations.$inferSelect): unknown {
+    if (invocation.resultPayload !== null && invocation.resultPayload !== undefined) return invocation.resultPayload;
     const summary = invocation.resultSummary?.summary;
     if (typeof summary !== "string") return null;
     try {
@@ -4251,11 +4301,13 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const resultPayload = completeStoredToolResult(resultValidation);
       const now = new Date();
       await db.update(toolInvocations).set({
         status: "succeeded",
         resultHash: resultValidation.summary.sha256 ?? null,
         resultSummary: resultValidation.summary,
+        resultPayload,
         resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
         completedAt: now,
         updatedAt: now,
@@ -5370,6 +5422,7 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         const [invocation] = await db.insert(toolInvocations).values({
           companyId: session.companyId,
           actorType: session.actorType ?? (session.agentId ? "agent" : "system"),
@@ -5389,6 +5442,7 @@ export function createToolGatewayService(
           status: "succeeded",
           resultHash: resultValidation.summary.sha256 ?? null,
           resultSummary: resultValidation.summary,
+          resultPayload,
           resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
           startedAt: new Date(),
           completedAt: new Date(),
@@ -5703,7 +5757,7 @@ export function createToolGatewayService(
             invocationId,
             status: "replayed" as const,
             tool: tool.name,
-            result: recorded.invocation.resultSummary ?? null,
+            result: recorded.invocation.resultPayload ?? recorded.invocation.resultSummary ?? null,
           };
         }
         if (accessDecision.decision === "require_approval") {
@@ -5812,12 +5866,14 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         await db
           .update(toolInvocations)
           .set({
             status: "succeeded",
             resultHash: resultValidation.summary.sha256 ?? null,
             resultSummary: resultValidation.summary,
+            resultPayload,
             resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
             completedAt: new Date(),
             updatedAt: new Date(),
@@ -6025,7 +6081,7 @@ export function createToolGatewayService(
       invocationId = recorded.invocation.id;
 
       if (recorded.replayed) {
-        return recorded.invocation.resultSummary;
+        return recorded.invocation.resultPayload ?? recorded.invocation.resultSummary;
       }
 
       if (accessDecision.decision === "require_approval") {
@@ -6104,12 +6160,14 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         await db
           .update(toolInvocations)
           .set({
             status: "succeeded",
             resultHash: resultValidation.summary.sha256 ?? null,
             resultSummary: resultValidation.summary,
+            resultPayload,
             resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
             completedAt: new Date(),
             updatedAt: new Date(),

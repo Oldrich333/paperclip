@@ -22,6 +22,9 @@
  *   pnpm --filter @paperclipai/db exec tsx scripts/clean-poisoned-claude-sessions.ts --dry-run
  *
  * Exits 0 on success even when nothing was healed. Idempotent.
+ * New session rows carry their effective local Claude config directory. The
+ * cleaner uses that persisted directory per row and falls back to the shared
+ * default for rows created before profile-aware persistence shipped.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -45,6 +48,7 @@ export interface ClaudeSessionRowInput {
   sessionId: string | null;
   cwd: string | null;
   isRemote: boolean;
+  claudeConfigDir: string | null;
 }
 
 /**
@@ -96,6 +100,28 @@ export function resolveClaudeConfigDir(env: NodeJS.ProcessEnv = process.env, ove
     return path.resolve(fromEnv);
   }
   return path.join(os.homedir(), ".claude");
+}
+
+export function resolveSessionClaudeConfigDir(
+  row: Pick<ClaudeSessionRowInput, "claudeConfigDir">,
+  fallback: string,
+  override?: string | null,
+): string {
+  if (override && override.trim().length > 0) return path.resolve(override);
+  if (row.claudeConfigDir && row.claudeConfigDir.trim().length > 0) {
+    return path.resolve(row.claudeConfigDir);
+  }
+  return fallback;
+}
+
+export function hasKnownSessionClaudeConfigDir(
+  row: Pick<ClaudeSessionRowInput, "claudeConfigDir">,
+  override?: string | null,
+): boolean {
+  return Boolean(
+    (override && override.trim().length > 0) ||
+    (row.claudeConfigDir && row.claudeConfigDir.trim().length > 0),
+  );
 }
 
 export function jsonlPathFor(input: { claudeConfigDir: string; cwd: string; sessionId: string }): string {
@@ -198,10 +224,15 @@ Flags:
                              the standard locations).
   --database-url <url>       Override DB connection string entirely.
   --claude-config-dir <path> Override Claude CLI config dir (default:
-                             $CLAUDE_CONFIG_DIR or ~/.claude).
+                             each session's persisted profile, then
+                             $CLAUDE_CONFIG_DIR or ~/.claude). This flag forces
+                             one directory for every scanned local row.
   --dry-run                  Report poisoned rows but do not delete.
   --delete-missing-jsonl     Also delete rows whose sessionId references a
-                             JSONL that no longer exists on disk.
+                             JSONL that no longer exists on disk. Legacy rows
+                             without a persisted profile require an explicit
+                             --claude-config-dir to avoid clearing a session
+                             that belongs to another profile.
   --json                     Emit a single JSON summary on stdout instead of
                              human-readable lines.
   -h, --help                 Print this usage.
@@ -255,19 +286,25 @@ interface Row {
   sessionParamsJson: Record<string, unknown> | null;
 }
 
-function extractSessionParams(row: Row): ClaudeSessionRowInput {
-  const params = row.sessionParamsJson ?? {};
-  const sessionId =
-    typeof params.sessionId === "string" && params.sessionId.length > 0
-      ? (params.sessionId as string)
-      : null;
-  const cwd =
-    typeof params.cwd === "string" && params.cwd.length > 0 ? (params.cwd as string) : null;
+export function extractSessionParams(
+  sessionParamsJson: Record<string, unknown> | null,
+): ClaudeSessionRowInput {
+  const params = sessionParamsJson ?? {};
+  const readString = (...values: unknown[]): string | null => {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    }
+    return null;
+  };
+  const sessionId = readString(params.sessionId, params.session_id);
+  const cwd = readString(params.cwd, params.workdir, params.folder);
+  const remoteExecution = params.remoteExecution ?? params.remote_execution;
   const isRemote =
-    "remoteExecution" in params &&
-    params.remoteExecution !== null &&
-    typeof params.remoteExecution === "object";
-  return { sessionId, cwd, isRemote };
+    remoteExecution !== null &&
+    typeof remoteExecution === "object" &&
+    !Array.isArray(remoteExecution);
+  const claudeConfigDir = readString(params.claudeConfigDir, params.claude_config_dir);
+  return { sessionId, cwd, isRemote, claudeConfigDir };
 }
 
 interface HealedPair {
@@ -292,7 +329,7 @@ async function main(argv: string[]): Promise<void> {
       "Unable to resolve database URL. Pass --database-url or --config <paperclip config.json>.",
     );
   }
-  const claudeConfigDir = resolveClaudeConfigDir(process.env, args.claudeConfigDir ?? undefined);
+  const defaultClaudeConfigDir = resolveClaudeConfigDir(process.env);
 
   const db = createDb(databaseUrl);
   const closableDb = db as typeof db & {
@@ -307,6 +344,7 @@ async function main(argv: string[]): Promise<void> {
     skippedRemote: 0,
     skippedNoSession: 0,
     unreadable: 0,
+    skippedUnknownProfile: 0,
     deleted: 0,
     dryRun: args.dryRun,
     healedPairs: [] as HealedPair[],
@@ -335,13 +373,18 @@ async function main(argv: string[]): Promise<void> {
       );
 
     log(
-      `Scanning ${rows.length} claude_local rows; claudeConfigDir=${claudeConfigDir}; dryRun=${args.dryRun}`,
+      `Scanning ${rows.length} claude_local rows; defaultClaudeConfigDir=${defaultClaudeConfigDir}; dryRun=${args.dryRun}`,
     );
 
     const toDelete: HealedPair[] = [];
     for (const row of rows) {
       summary.scanned += 1;
-      const input = extractSessionParams(row);
+      const input = extractSessionParams(row.sessionParamsJson);
+      const claudeConfigDir = resolveSessionClaudeConfigDir(
+        input,
+        defaultClaudeConfigDir,
+        args.claudeConfigDir,
+      );
       const classification = classifyRow(input, {
         claudeConfigDir,
         readJsonl: readJsonlSafe,
@@ -372,7 +415,7 @@ async function main(argv: string[]): Promise<void> {
           break;
         case "missing_jsonl": {
           summary.missingJsonl += 1;
-          if (args.deleteMissing) {
+          if (args.deleteMissing && hasKnownSessionClaudeConfigDir(input, args.claudeConfigDir)) {
             toDelete.push({
               rowId: row.id,
               agentId: row.agentId,
@@ -382,6 +425,11 @@ async function main(argv: string[]): Promise<void> {
               jsonlPath: classification.jsonlPath ?? null,
               reason: "missing_jsonl",
             });
+          } else if (args.deleteMissing) {
+            summary.skippedUnknownProfile += 1;
+            log(
+              `[skip] legacy row has no persisted Claude profile; pass --claude-config-dir to clear it deliberately row=${row.id} agent=${row.agentId} task=${row.taskKey}`,
+            );
           } else {
             log(
               `[skip] missing jsonl (use --delete-missing-jsonl to clear) row=${row.id} agent=${row.agentId} task=${row.taskKey} jsonl=${classification.jsonlPath}`,
