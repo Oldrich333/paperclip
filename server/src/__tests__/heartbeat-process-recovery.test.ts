@@ -41,6 +41,7 @@ import {
   plugins,
   projects,
   projectWorkspaces,
+  routines,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -3748,6 +3749,87 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
+  });
+
+  it("skips successful-run handoff for an active routine execution issue", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const routineId = randomUUID();
+    const now = new Date("2026-03-19T00:00:00.000Z");
+
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Reliability watcher",
+      parentIssueId: null,
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db
+      .update(issues)
+      .set({
+        originKind: "routine_execution",
+        originId: routineId,
+      })
+      .where(eq(issues.id, issueId));
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueId,
+      runId,
+      details: {
+        sourceRunId: runId,
+      },
+      createdAt: new Date(now.getTime() - 1_000),
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Completed the bounded routine pass without changing its coalesced execution issue.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Completed the bounded routine pass without changing its coalesced execution issue.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(handoffWakeups.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff")).toHaveLength(0);
+
+    const resolvedHandoff = await db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.successful_run_handoff_resolved"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(resolvedHandoff?.details).toMatchObject({
+      sourceRunId: runId,
+      resolvedByRunId: runId,
+      resolvedBySkipReason: "active routine continuation owns the next action",
+    });
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

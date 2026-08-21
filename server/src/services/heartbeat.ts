@@ -9375,6 +9375,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         monitorNextCheckAt: issues.monitorNextCheckAt,
         projectId: issues.projectId,
         originKind: issues.originKind,
+        originId: issues.originId,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -9548,7 +9549,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(
             and(
               eq(routines.companyId, issue.companyId),
-              eq(routines.parentIssueId, issue.id),
+              issue.originKind === "routine_execution" && issue.originId
+                ? or(
+                  eq(routines.parentIssueId, issue.id),
+                  eq(routines.id, issue.originId),
+                )
+                : eq(routines.parentIssueId, issue.id),
               eq(routines.status, "active"),
             ),
           )
