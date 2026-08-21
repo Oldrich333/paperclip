@@ -71,8 +71,10 @@ import {
   pathExists,
   prepareManagedCodexHome,
   resolveManagedCodexHomeDir,
+  resolveManagedCodexRunHomeDir,
   resolveSharedCodexHomeDir,
   seedManagedCodexHome,
+  seedManagedCodexRunHome,
   stageCodexHomeForSync,
   mergeManagedCodexMcpGateways,
   writeManagedCodexMcpConfig,
@@ -658,8 +660,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
-  const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
-  await fs.mkdir(effectiveCodexHome, { recursive: true });
+  const managedCodexHome = configuredCodexHome ?? defaultCodexHome;
+  const runScopedCodexHome =
+    configuredCodexHome == null || configuredHomeIsManaged
+      ? resolveManagedCodexRunHomeDir(managedCodexHome, runId)
+      : null;
+  const effectiveCodexHome = runScopedCodexHome ?? managedCodexHome;
+  if (runScopedCodexHome) {
+    await seedManagedCodexRunHome(
+      effectiveCodexHome,
+      managedCodexHome,
+      process.env,
+      onLog,
+      { apiKey: configuredOpenAiApiKey },
+    );
+  } else {
+    await fs.mkdir(effectiveCodexHome, { recursive: true });
+  }
+
+  const removeRunScopedCodexHome = async (): Promise<void> => {
+    if (runScopedCodexHome) {
+      await fs.rm(runScopedCodexHome, { recursive: true, force: true }).catch(() => {});
+    }
+  };
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
   // and with OPENAI_API_KEY="" the provider rejects every request with
@@ -671,16 +694,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // and sandbox targets are additionally allowed to supply their own login
   // (the pre-dispatch gate defers sandbox-destined runs here for exactly that
   // probe).
-  await assertCodexCredentialsLaunchable({
-    runId,
-    companyId: agent.companyId,
-    configuredCodexHome,
-    configuredApiKey: configuredOpenAiApiKey,
-    effectiveCodexHome,
-    target: executionTarget,
-    cwd,
-    onLog,
-  });
+  try {
+    await assertCodexCredentialsLaunchable({
+      runId,
+      companyId: agent.companyId,
+      configuredCodexHome,
+      configuredApiKey: configuredOpenAiApiKey,
+      effectiveCodexHome,
+      target: executionTarget,
+      cwd,
+      onLog,
+    });
+  } catch (error) {
+    await removeRunScopedCodexHome();
+    throw error;
+  }
   // Merge custom model providers (PAPERCLIP_CODEX_PROVIDERS) into the managed
   // CODEX_HOME's config.toml BEFORE the home is shipped to a remote execution
   // target, so both local and sandboxed Codex processes pick up the routing.
@@ -690,10 +718,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
-  const preparedRuntimeConfig = await prepareCodexRuntimeConfig({
-    env: envConfigStrings,
-    codexHome: configuredCodexHome ? null : effectiveCodexHome,
-  });
+  let preparedRuntimeConfig: Awaited<ReturnType<typeof prepareCodexRuntimeConfig>>;
+  try {
+    preparedRuntimeConfig = await prepareCodexRuntimeConfig({
+      env: envConfigStrings,
+      codexHome: configuredCodexHome ? null : effectiveCodexHome,
+    });
+  } catch (error) {
+    await removeRunScopedCodexHome();
+    throw error;
+  }
   // Curated allowlist dir staged for the remote `home` asset (see below). Held
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
@@ -1554,6 +1588,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // If the process dies before reaching this, the next
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
-    await preparedRuntimeConfig.cleanup();
+    try {
+      await preparedRuntimeConfig.cleanup();
+    } finally {
+      await removeRunScopedCodexHome();
+    }
   }
 }

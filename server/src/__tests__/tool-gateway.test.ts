@@ -529,7 +529,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       body: {
         jsonrpc: "2.0",
         id: "test",
-        result: { content: [{ type: "text", text: "read ok" }], structuredContent: { ok: true } },
+        result: { content: [{ type: "text", text: "read ok" }], data: { structuredContent: { ok: true } } },
       },
     }));
     try {
@@ -598,6 +598,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         })
         .expect(200);
       expect(called.body.result.content).toEqual([{ type: "text", text: "read ok" }]);
+      expect(called.body.result.structuredContent).toEqual({ ok: true });
       const upstreamRequestCountAfterAllowedCall = remote.requests.length;
 
       const denied = await request(app)

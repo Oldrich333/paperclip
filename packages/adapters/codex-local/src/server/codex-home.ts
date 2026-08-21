@@ -793,3 +793,58 @@ export async function evaluateCodexCredentialReadiness(
     (await codexHomeHasUsableAuth(sharedSourceHome));
   return { managed: true, authMode: "subscription", ready, effectiveHome, sharedSourceHome };
 }
+
+export function resolveManagedCodexRunHomeDir(baseHome: string, runId: string): string {
+  const normalizedRunId = runId.trim();
+  if (
+    normalizedRunId.length === 0 ||
+    normalizedRunId.includes("/") ||
+    normalizedRunId.includes("\\")
+  ) {
+    throw new Error("Codex run id must be a non-empty path-safe identifier");
+  }
+  return path.resolve(baseHome, "runs", normalizedRunId);
+}
+
+/**
+ * Creates a disposable run home with an independent config.toml. Runtime
+ * state remains linked to the managed base home so Codex session continuation
+ * keeps working, but concurrent runs never read or write one another's MCP
+ * bearer configuration.
+ */
+export async function seedManagedCodexRunHome(
+  targetHome: string,
+  sourceHome: string,
+  env: NodeJS.ProcessEnv,
+  onLog: AdapterExecutionContext["onLog"],
+  options: { apiKey?: string | null } = {},
+): Promise<void> {
+  if (path.resolve(targetHome) === path.resolve(sourceHome)) {
+    throw new Error("Codex run home must differ from its managed base home");
+  }
+
+  try {
+    await seedManagedCodexHome(targetHome, env, onLog, options);
+
+    for (const name of COPIED_SHARED_FILES) {
+      const source = path.join(sourceHome, name);
+      if (!(await pathExists(source))) continue;
+      const target = path.join(targetHome, name);
+      await fs.copyFile(source, target);
+      await fs.chmod(target, 0o600);
+    }
+
+    const sourceEntries = await fs.readdir(sourceHome, { withFileTypes: true }).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    });
+    const staticEntries = new Set([...COPIED_SHARED_FILES, ...SYMLINKED_SHARED_FILES, "skills"]);
+    for (const entry of sourceEntries) {
+      if (staticEntries.has(entry.name) || entry.name === "runs") continue;
+      await ensureSymlink(path.join(targetHome, entry.name), path.join(sourceHome, entry.name));
+    }
+  } catch (error) {
+    await fs.rm(targetHome, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}

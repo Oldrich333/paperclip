@@ -25,12 +25,15 @@ const payload = {
     .filter((key) => key.startsWith("PAPERCLIP_"))
     .sort(),
 };
-if (capturePath) {
-  fs.writeFileSync(capturePath, JSON.stringify(payload), "utf8");
-}
-console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session-1" }));
-console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "hello" } }));
-console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } }));
+const emit = () => {
+  if (capturePath) {
+    fs.writeFileSync(capturePath, JSON.stringify(payload), "utf8");
+  }
+  console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session-1" }));
+  console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "hello" } }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } }));
+};
+setTimeout(emit, Number(process.env.PAPERCLIP_TEST_DELAY_MS || "0"));
 `;
   await fs.writeFile(commandPath, script, "utf8");
   await fs.chmod(commandPath, 0o755);
@@ -189,7 +192,8 @@ describe("codex execute", () => {
       expect(result.costUsd).toBeNull();
 
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
-      expect(capture.codexHome).toBe(managedCodexHome);
+      expect(capture.codexHome).toBe(path.join(managedCodexHome, "runs", "run-default"));
+      await expect(fs.lstat(path.join(managedCodexHome, "runs", "run-default"))).rejects.toThrow();
 
       const managedAuth = path.join(managedCodexHome, "auth.json");
       const managedConfig = path.join(managedCodexHome, "config.toml");
@@ -218,6 +222,122 @@ describe("codex execute", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  it("isolates managed MCP configuration for concurrent heartbeat runs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-concurrent-mcp-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const longCapturePath = path.join(root, "long-capture.json");
+    const shortCapturePath = path.join(root, "short-capture.json");
+    const sharedCodexHome = path.join(root, "shared-codex-home");
+    const paperclipHome = path.join(root, "paperclip-home");
+    const managedCodexHome = path.join(
+      paperclipHome,
+      "instances",
+      "default",
+      "companies",
+      "company-1",
+      "codex-home",
+    );
+    const originalConfig = 'model = "codex-mini-latest"\n';
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(sharedCodexHome, { recursive: true });
+    await fs.writeFile(path.join(sharedCodexHome, "auth.json"), fakeCodexAuthJson + "\n", "utf8");
+    await fs.writeFile(path.join(sharedCodexHome, "config.toml"), originalConfig, "utf8");
+    await writeFakeCodexCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousPaperclipInWorktree = process.env.PAPERCLIP_IN_WORKTREE;
+    const previousPaperclipApiUrl = process.env.PAPERCLIP_API_URL;
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_IN_WORKTREE;
+    process.env.PAPERCLIP_API_URL = "http://paperclip.local:3100";
+    process.env.CODEX_HOME = sharedCodexHome;
+
+    const run = (runId: string, capturePath: string, token: string) =>
+      execute({
+        runId,
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath,
+            PAPERCLIP_TEST_DELAY_MS: "200",
+          },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        runtimeMcp: {
+          getServers: () => [
+            {
+              name: "gateway",
+              url: "http://paperclip.local:3100/api/tool-gateway/gateways/gateway-1/mcp",
+              token,
+              connectionId: "connection-" + runId,
+            },
+          ],
+        },
+        context: {},
+        authToken: "run-auth-token",
+        onLog: async () => {},
+      });
+
+    try {
+      const [longResult, shortResult] = await Promise.all([
+        run("long-run", longCapturePath, "long-run-token"),
+        run("short-run", shortCapturePath, "short-run-token"),
+      ]);
+      expect(longResult.exitCode).toBe(0);
+      expect(shortResult.exitCode).toBe(0);
+
+      const longCapture = JSON.parse(await fs.readFile(longCapturePath, "utf8")) as CapturePayload;
+      const shortCapture = JSON.parse(await fs.readFile(shortCapturePath, "utf8")) as CapturePayload;
+      expect(longCapture.codexHome).toBe(path.join(managedCodexHome, "runs", "long-run"));
+      expect(shortCapture.codexHome).toBe(path.join(managedCodexHome, "runs", "short-run"));
+
+      const longConfig = longCapture.codexConfigContents ?? "";
+      const shortConfig = shortCapture.codexConfigContents ?? "";
+      expect(longConfig).toContain("long-run-token");
+      expect(longConfig).not.toContain("short-run-token");
+      expect(shortConfig).toContain("short-run-token");
+      expect(shortConfig).not.toContain("long-run-token");
+      expect(await fs.readFile(path.join(managedCodexHome, "config.toml"), "utf8")).toBe(originalConfig);
+      await expect(fs.lstat(path.join(managedCodexHome, "runs", "long-run"))).rejects.toThrow();
+      await expect(fs.lstat(path.join(managedCodexHome, "runs", "short-run"))).rejects.toThrow();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      if (previousPaperclipInWorktree === undefined) delete process.env.PAPERCLIP_IN_WORKTREE;
+      else process.env.PAPERCLIP_IN_WORKTREE = previousPaperclipInWorktree;
+      if (previousPaperclipApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+      else process.env.PAPERCLIP_API_URL = previousPaperclipApiUrl;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("writes managed MCP gateways into Codex config and warns on overlapping direct entries without logging tokens", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-managed-mcp-"));
@@ -1395,7 +1515,8 @@ process.exit(1);
       expect(result.errorMessage).toBeNull();
 
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
-      expect(capture.codexHome).toBe(isolatedCodexHome);
+      expect(capture.codexHome).toBe(path.join(isolatedCodexHome, "runs", "run-1"));
+      await expect(fs.lstat(path.join(isolatedCodexHome, "runs", "run-1"))).rejects.toThrow();
       expect(capture.argv).toEqual(expect.arrayContaining(["exec", "--json", "-"]));
       expect(capture.prompt).toContain("Follow the paperclip heartbeat.");
       expect(capture.paperclipEnvKeys).toEqual(
@@ -1415,7 +1536,7 @@ process.exit(1);
       expect(await fs.realpath(isolatedAuth)).toBe(await fs.realpath(path.join(sharedCodexHome, "auth.json")));
       expect((await fs.lstat(isolatedConfig)).isFile()).toBe(true);
       expect(await fs.readFile(isolatedConfig, "utf8")).toBe('model = "codex-mini-latest"\n');
-      expect((await fs.lstat(homeSkill)).isSymbolicLink()).toBe(true);
+      await expect(fs.lstat(homeSkill)).rejects.toThrow();
       expect(logs).toContainEqual(
         expect.objectContaining({
           stream: "stdout",

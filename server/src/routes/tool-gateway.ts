@@ -137,6 +137,14 @@ async function handleMcpGatewayProtocol(
       const resultRecord = result.result && typeof result.result === "object" && !Array.isArray(result.result)
         ? result.result as Record<string, unknown>
         : null;
+      const resultData = resultRecord?.data && typeof resultRecord.data === "object" && !Array.isArray(resultRecord.data)
+        ? resultRecord.data as Record<string, unknown>
+        : null;
+      const structuredContent = resultData?.structuredContent;
+      const hasStructuredContent =
+        structuredContent !== null &&
+        typeof structuredContent === "object" &&
+        !Array.isArray(structuredContent);
       const contentText = typeof resultRecord?.content === "string"
         ? resultRecord.content
         : JSON.stringify(resultRecord?.data ?? result.result ?? null);
@@ -145,7 +153,7 @@ async function handleMcpGatewayProtocol(
         id,
         result: {
           content: [{ type: "text", text: contentText }],
-          structuredContent: resultRecord?.data ?? null,
+          ...(hasStructuredContent ? { structuredContent } : {}),
           isError: false,
         },
       });
