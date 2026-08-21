@@ -540,8 +540,12 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     const beforeAssignment = await heartbeat.reconcileIssueGraphLiveness();
 
-    expect(beforeAssignment.dependencyWakesHealed).toBe(0);
-    expect(beforeAssignment.dependencyWakeBackstopChecked).toBe(0);
+    expect(beforeAssignment.dependencyWakesHealed).toBe(1);
+    expect(beforeAssignment.dependencyWakeBackstopChecked).toBe(1);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockedIssueId))
+        .then((rows) => rows[0]?.status),
+    ).resolves.toBe("todo");
 
     await db
       .update(issues)
@@ -550,22 +554,17 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     const afterAssignment = await heartbeat.reconcileIssueGraphLiveness();
 
-    expect(afterAssignment.dependencyWakesHealed).toBe(1);
-    expect(afterAssignment.dependencyWakeIssueIds).toEqual([blockedIssueId]);
+    expect(afterAssignment.dependencyWakesHealed).toBe(0);
+    expect(afterAssignment.dependencyWakeIssueIds).toEqual([]);
 
-    const wake = await db
+    const wakes = await db
       .select({
         reason: agentWakeupRequests.reason,
         idempotencyKey: agentWakeupRequests.idempotencyKey,
       })
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.agentId, agentId))
-      .orderBy(agentWakeupRequests.requestedAt)
-      .then((rows) => rows[0] ?? null);
-    expect(wake).toMatchObject({
-      reason: "issue_blockers_resolved",
-      idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
-    });
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toEqual([]);
   });
 
   it("retries a resolved dependency wake when the prior wake was skipped as stale", async () => {

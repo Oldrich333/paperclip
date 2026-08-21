@@ -4182,13 +4182,86 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await svc.update(blockerB, { status: "done" });
 
-    await expect(svc.listWakeableBlockedDependents(blockerA)).resolves.toEqual([
-      expect.objectContaining({
-        id: blockedIssueId,
+    await expect(svc.getById(blockedIssueId)).resolves.toMatchObject({
+      id: blockedIssueId,
+      status: "todo",
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerA)).resolves.toEqual([]);
+  });
+
+  it.each([
+    { blockerStatus: "done" as const, assigned: true },
+    { blockerStatus: "done" as const, assigned: false },
+    { blockerStatus: "cancelled" as const, assigned: true },
+    { blockerStatus: "cancelled" as const, assigned: false },
+  ])("unblocks a $blockerStatus blocker dependency for $assigned assigned dependents", async ({ blockerStatus, assigned }) => {
+    const companyId = randomUUID();
+    const assigneeAgentId = assigned ? randomUUID() : null;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    if (assigneeAgentId) {
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: `CodexCoder-${assigneeAgentId.slice(0, 6)}`,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "todo", priority: "medium" },
+      {
+        id: dependentId,
+        companyId,
+        title: "Dependent",
+        status: "blocked",
+        priority: "medium",
         assigneeAgentId,
-        blockerIssueIds: expect.arrayContaining([blockerA, blockerB]),
-      }),
+      },
     ]);
+    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
+
+    await svc.update(blockerId, { status: blockerStatus });
+
+    await expect(svc.getById(dependentId)).resolves.toMatchObject({
+      id: dependentId,
+      status: "todo",
+    });
+  });
+
+  it("rejects service-level blocked transitions without a blocker, attention, or descriptor", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unjustified blocked transition",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await expect(svc.update(issueId, { status: "blocked" })).rejects.toMatchObject({ status: 422 });
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Review the service-level stop" },
+    })).resolves.toMatchObject({ status: "blocked" });
   });
 
   it("treats done blockers on a shared workspace as ready while a foreign issue is in-flight", async () => {

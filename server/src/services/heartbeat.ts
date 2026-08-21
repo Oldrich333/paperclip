@@ -156,7 +156,10 @@ import { authorizationService, type AuthorizationActor } from "./authorization.j
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  buildIssueBlockersResolvedWakeIdempotencyKey,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -6727,7 +6730,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
-  const issuesSvc = issueService(db);
+  const issuesSvc = issueService(db, {
+    onDependencyResolved: async (wakeup) => {
+      const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: wakeup.dependentIssueId,
+        resolvedBlockerIssueId: wakeup.blockerIssueId,
+      });
+      await enqueueWakeup(wakeup.dependentAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        payload: {
+          issueId: wakeup.dependentIssueId,
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+          mutation: "service_update",
+        },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: {
+          issueId: wakeup.dependentIssueId,
+          taskId: wakeup.dependentIssueId,
+          wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          source: "issue.service_update",
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+        },
+      });
+    },
+  });
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const environmentsSvc = environmentService(db);
@@ -18251,17 +18283,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               `- Reason: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE}`,
               `- Next action: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`,
             ].join("\n");
-            await tx
-              .update(issues)
-              .set({
-                status: "blocked",
-                checkoutRunId: null,
-                executionRunId: null,
-                executionAgentNameKey: null,
-                executionLockedAt: null,
-                updatedAt: now,
-              })
-              .where(eq(issues.id, issue.id));
+            await issuesSvc.update(issue.id, {
+              status: "blocked",
+              unblockDescriptor: {
+                owner: "board",
+                action: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+              },
+            }, tx);
             await tx.insert(issueComments).values({
               companyId: issue.companyId,
               issueId: issue.id,

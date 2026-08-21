@@ -758,6 +758,19 @@ export type IssueDependencyReadiness = {
   allBlockersDone: boolean;
   isDependencyReady: boolean;
 };
+
+export type IssueDependencyResolvedWakeup = {
+  companyId: string;
+  blockerIssueId: string;
+  dependentIssueId: string;
+  dependentAgentId: string;
+  blockerIssueIds: string[];
+};
+
+export type IssueServiceOptions = {
+  onDependencyResolved?: (wakeup: IssueDependencyResolvedWakeup) => Promise<void>;
+};
+
 export type ChildIssueCompletionSummary = {
   id: string;
   identifier: string | null;
@@ -1238,7 +1251,7 @@ async function listIssueDependencyReadinessMap(
     );
 
   // Collect issue/workspace pairs of "done" blockers — these are the only ones
-  // subject to the workspace-finalize barrier. Blockers that aren't done already
+  // subject to the workspace-finalize barrier. Non-terminal blockers already
   // mark the dependent as not-ready and don't need a finalize check.
   const doneBlockerWorkspacePairs: Array<{ blockerIssueId: string; executionWorkspaceId: string }> = [];
   for (const row of blockerRows) {
@@ -1258,9 +1271,10 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
-    if (row.blockerStatus !== "done") {
+    // Both terminal statuses resolve a dependency. A cancelled blocker cannot
+    // make further progress, so keeping it unresolved permanently strands the
+    // dependent even though the dependency graph is no longer actionable.
+    if (row.blockerStatus !== "done" && row.blockerStatus !== "cancelled") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -4395,7 +4409,156 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
-export function issueService(db: Db) {
+type UnblockedDependency = {
+  companyId: string;
+  blockerIssueId: string;
+  dependentIssueId: string;
+  dependentAgentId: string | null;
+  blockerIssueIds: string[];
+};
+
+async function assertEnteringBlockedAllowed(
+  dbOrTx: any,
+  issue: typeof issues.$inferSelect,
+  issueData: Partial<typeof issues.$inferInsert>,
+  blockedByIssueIds: string[] | undefined,
+) {
+  const readiness = blockedByIssueIds === undefined
+    ? (await listIssueDependencyReadinessMap(dbOrTx, issue.companyId, [issue.id])).get(issue.id)
+    : null;
+  const hasUnresolvedBlocker = blockedByIssueIds !== undefined
+    ? (await listUnresolvedBlockerIssueIds(dbOrTx, issue.companyId, blockedByIssueIds)).length > 0
+    : (readiness?.unresolvedBlockerCount ?? 0) > 0;
+  const [pendingInteraction, pendingApproval] = await Promise.all([
+    dbOrTx
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, issue.companyId),
+        eq(issueThreadInteractions.issueId, issue.id),
+        inArray(issueThreadInteractions.status, BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES),
+      ))
+      .limit(1)
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+    dbOrTx
+      .select({ id: approvals.id })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(and(
+        eq(issueApprovals.companyId, issue.companyId),
+        eq(issueApprovals.issueId, issue.id),
+        inArray(approvals.status, BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES),
+      ))
+      .limit(1)
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+  ]);
+  const hasDescriptor = issueData.unblockDescriptor != null;
+  if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !hasDescriptor) {
+    throw unprocessable("Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor");
+  }
+}
+
+async function unblockResolvedBlockedDependents(
+  dbOrTx: any,
+  blockerIssueId: string,
+  dependentIssueId?: string,
+): Promise<UnblockedDependency[]> {
+  const blockerIssue = await dbOrTx
+    .select({ id: issues.id, companyId: issues.companyId })
+    .from(issues)
+    .where(eq(issues.id, blockerIssueId))
+    .then((rows: Array<{ id: string; companyId: string }>) => rows[0] ?? null);
+  if (!blockerIssue) return [];
+
+  const filters = [
+    eq(issueRelations.companyId, blockerIssue.companyId),
+    eq(issueRelations.type, "blocks"),
+    eq(issueRelations.issueId, blockerIssueId),
+    eq(issues.status, "blocked"),
+  ];
+  if (dependentIssueId) filters.push(eq(issues.id, dependentIssueId));
+  const candidates = await dbOrTx
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      assigneeAgentId: issues.assigneeAgentId,
+      unblockDescriptor: issues.unblockDescriptor,
+    })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(and(...filters));
+  if (candidates.length === 0) return [];
+
+  const readinessMap = await listIssueDependencyReadinessMap(
+    dbOrTx,
+    blockerIssue.companyId,
+    candidates.map((candidate: { id: string }) => candidate.id),
+  );
+  const candidateIds = candidates.map((candidate: { id: string }) => candidate.id);
+  const [pendingInteractions, pendingApprovals] = await Promise.all([
+    dbOrTx
+      .select({ issueId: issueThreadInteractions.issueId })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, blockerIssue.companyId),
+        inArray(issueThreadInteractions.issueId, candidateIds),
+        inArray(issueThreadInteractions.status, BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES),
+      )),
+    dbOrTx
+      .select({ issueId: issueApprovals.issueId })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(and(
+        eq(issueApprovals.companyId, blockerIssue.companyId),
+        inArray(issueApprovals.issueId, candidateIds),
+        inArray(approvals.status, BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES),
+      )),
+  ]);
+  const pendingInteractionIds = new Set(pendingInteractions.map((row: { issueId: string }) => row.issueId));
+  const pendingApprovalIds = new Set(pendingApprovals.map((row: { issueId: string }) => row.issueId));
+  const unblocked: UnblockedDependency[] = [];
+
+  for (const candidate of candidates) {
+    const readiness = readinessMap.get(candidate.id);
+    if (
+      !readiness?.isDependencyReady ||
+      readiness.blockerIssueIds.length === 0 ||
+      candidate.unblockDescriptor ||
+      pendingInteractionIds.has(candidate.id) ||
+      pendingApprovalIds.has(candidate.id)
+    ) continue;
+
+    const now = new Date();
+    const updated = await dbOrTx
+      .update(issues)
+      .set({
+        status: "todo",
+        unblockDescriptor: null,
+        blockedTransitionAt: null,
+        blockedOwnerNotifiedAt: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        completedAt: null,
+        cancelledAt: null,
+        updatedAt: now,
+      })
+      .where(and(eq(issues.id, candidate.id), eq(issues.status, "blocked")))
+      .returning({ id: issues.id });
+    if (updated.length === 0) continue;
+    unblocked.push({
+      companyId: candidate.companyId,
+      blockerIssueId,
+      dependentIssueId: candidate.id,
+      dependentAgentId: candidate.assigneeAgentId,
+      blockerIssueIds: readiness.blockerIssueIds,
+    });
+  }
+  return unblocked;
+}
+
+export function issueService(db: Db, options: IssueServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
 
@@ -6460,6 +6623,32 @@ export function issueService(db: Db) {
       return listIssueProductivityReviewMap(dbOrTx, companyId, sourceIssueIds);
     },
 
+    unblockResolvedBlockedDependents: async (
+      blockerIssueId: string,
+      dbOrTx: any = db,
+      dependentIssueId?: string,
+      emitWake = true,
+    ) => {
+      const unblocked = await unblockResolvedBlockedDependents(dbOrTx, blockerIssueId, dependentIssueId);
+      if (emitWake && dbOrTx === db && options.onDependencyResolved) {
+        for (const dependent of unblocked) {
+          if (!dependent.dependentAgentId) continue;
+          try {
+            await options.onDependencyResolved({
+              companyId: dependent.companyId,
+              blockerIssueId: dependent.blockerIssueId,
+              dependentIssueId: dependent.dependentIssueId,
+              dependentAgentId: dependent.dependentAgentId,
+              blockerIssueIds: dependent.blockerIssueIds,
+            });
+          } catch (error) {
+            logger.warn({ error, ...dependent }, "failed to emit dependency-resolved wakeup after dependent repair");
+          }
+        }
+      }
+      return unblocked;
+    },
+
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
       const blockerIssue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -6481,28 +6670,21 @@ export function issueService(db: Db) {
             eq(issueRelations.companyId, blockerIssue.companyId),
             eq(issueRelations.type, "blocks"),
             eq(issueRelations.issueId, blockerIssueId),
+            eq(issues.status, "blocked"),
           ),
         );
       if (candidates.length === 0) return [];
 
-      const wakeableCandidates = candidates.filter(
-        (candidate) =>
-          candidate.assigneeAgentId && !["backlog", "done", "cancelled"].includes(candidate.status),
-      );
-      if (wakeableCandidates.length === 0) return [];
-
-      // Defer to the unified readiness check so that a dependent only fires when
-      // (a) every blocker is done AND (b) every done blocker's workspace has
-      // recorded a successful workspace_finalize. The finalize hook also calls
-      // this function on completion, so a wake initially gated by an in-flight
-      // sync-back will re-fire once the restore lands locally.
+      // Keep unassigned dependents in the readiness result so callers that only
+      // need to repair state do not silently drop them. Wake emitters may skip
+      // the nullable assignee, but the dependent must still leave `blocked`.
       const readinessMap = await listIssueDependencyReadinessMap(
         db,
         blockerIssue.companyId,
-        wakeableCandidates.map((candidate) => candidate.id),
+        candidates.map((candidate) => candidate.id),
       );
 
-      return wakeableCandidates
+      return candidates
         .map((candidate) => {
           const readiness = readinessMap.get(candidate.id) ?? createIssueDependencyReadiness(candidate.id);
           return { candidate, readiness };
@@ -6510,7 +6692,7 @@ export function issueService(db: Db) {
         .filter(({ readiness }) => readiness.isDependencyReady && readiness.blockerIssueIds.length > 0)
         .map(({ candidate, readiness }) => ({
           id: candidate.id,
-          assigneeAgentId: candidate.assigneeAgentId!,
+          assigneeAgentId: candidate.assigneeAgentId,
           blockerIssueIds: readiness.blockerIssueIds,
         }));
     },
@@ -7546,6 +7728,7 @@ export function issueService(db: Db) {
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications = postCommitActivityPublications ?? ownedActivityPublications;
+      const dependencyWakeups: IssueDependencyResolvedWakeup[] = [];
       const existing = await dbOrTx
         .select()
         .from(issues)
@@ -7570,7 +7753,6 @@ export function issueService(db: Db) {
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
       }
-
       const patch: Partial<typeof issues.$inferInsert> = {
         ...issueData,
         updatedAt: new Date(),
@@ -7713,6 +7895,9 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (receiptExisting.status !== "blocked" && issueData.status === "blocked") {
+          await assertEnteringBlockedAllowed(tx, receiptExisting, issueData, blockedByIssueIds);
+        }
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])
@@ -7838,6 +8023,18 @@ export function issueService(db: Db) {
             tx,
           );
         }
+        if (existing.status !== updated.status && (updated.status === "done" || updated.status === "cancelled")) {
+          const unblocked = await unblockResolvedBlockedDependents(tx, updated.id);
+          for (const dependent of unblocked) {
+            if (dependent.dependentAgentId) dependencyWakeups.push({
+              companyId: dependent.companyId,
+              blockerIssueId: dependent.blockerIssueId,
+              dependentIssueId: dependent.dependentIssueId,
+              dependentAgentId: dependent.dependentAgentId,
+              blockerIssueIds: dependent.blockerIssueIds,
+            });
+          }
+        }
         if (
           issueData.executionWorkspaceSettings !== undefined &&
           nextExecutionWorkspaceId &&
@@ -7953,6 +8150,15 @@ export function issueService(db: Db) {
       const result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications) publishActivity(publication);
+      }
+      if (dbOrTx === db && options.onDependencyResolved) {
+        for (const wakeup of dependencyWakeups) {
+          try {
+            await options.onDependencyResolved(wakeup);
+          } catch (error) {
+            logger.warn({ error, ...wakeup }, "failed to emit dependency-resolved wakeup after issue update");
+          }
+        }
       }
       return result;
     },

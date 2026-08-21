@@ -764,7 +764,36 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
 }
 
 export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
-  const issuesSvc = issueService(db);
+  const issuesSvc = issueService(db, {
+    onDependencyResolved: async (wakeup) => {
+      const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: wakeup.dependentIssueId,
+        resolvedBlockerIssueId: wakeup.blockerIssueId,
+      });
+      await deps.enqueueWakeup(wakeup.dependentAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        payload: {
+          issueId: wakeup.dependentIssueId,
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+          mutation: "recovery_service_update",
+        },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: {
+          issueId: wakeup.dependentIssueId,
+          taskId: wakeup.dependentIssueId,
+          wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          source: "recovery.issue_service_update",
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+        },
+      });
+    },
+  });
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
@@ -3129,7 +3158,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+      unblockDescriptor: {
+        owner: input.issue.assigneeAgentId ? { agentId: input.issue.assigneeAgentId } : "board",
+        action: "Inspect the failed recovery run and restore a live execution path.",
+      },
+    });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -3341,6 +3376,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       status: "blocked",
       blockedByIssueIds: blockerIds,
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      ...(blockerIds.length === 0
+        ? {
+            unblockDescriptor: {
+              owner: recoveryAction.ownerAgentId ? { agentId: recoveryAction.ownerAgentId } : "board",
+              action: "Review the recovery action and restore a live execution path.",
+            },
+          }
+        : {}),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
@@ -3498,6 +3541,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           status: "blocked",
           blockedByIssueIds: blockerIds,
           assigneeAgentId: recoveryAction.ownerAgentId,
+          ...(blockerIds.length === 0
+            ? {
+                unblockDescriptor: {
+                  owner: recoveryAction.ownerAgentId ? { agentId: recoveryAction.ownerAgentId } : "board",
+                  action: "Review the recovery action and restore a live execution path.",
+                },
+              }
+            : {}),
         });
         if (reblocked) return reblocked;
       }
@@ -3648,8 +3699,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress", "in_review"]),
           or(
-            sql`${issues.assigneeAgentId} is not null`,
-            eq(issues.status, "in_review"),
+                eq(issues.status, "in_review"),
           ),
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
@@ -5150,7 +5200,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       const filters = [
         eq(issues.status, "blocked"),
         visibleIssueCondition(),
-        sql`${issues.assigneeAgentId} is not null`,
       ];
       if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
       if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
@@ -5190,6 +5239,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .orderBy(asc(issues.id))
         .limit(RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
     };
+
+    if (opts?.blockerIssueId) {
+      const repaired = await issuesSvc.unblockResolvedBlockedDependents(opts.blockerIssueId);
+      result.healed += repaired.length;
+      result.issueIds.push(...repaired.map((dependent) => dependent.dependentIssueId));
+      for (const dependent of repaired) {
+        await logActivity(db, {
+          companyId: dependent.companyId,
+          actorType: "system",
+          actorId: "issue_graph_liveness_backstop",
+          agentId: dependent.dependentAgentId,
+          runId: opts?.runId ?? null,
+          action: "issue.blockers_resolved_wake_emitted",
+          entityType: "issue",
+          entityId: dependent.dependentIssueId,
+          details: {
+            source,
+            wakeupRunId: null,
+            idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({
+              dependentIssueId: dependent.dependentIssueId,
+              resolvedBlockerIssueId: dependent.blockerIssueId,
+            }),
+            resolvedBlockerIssueId: dependent.blockerIssueId,
+            blockerIssueIds: dependent.blockerIssueIds,
+            stateRepair: true,
+          },
+        });
+      }
+    }
 
     let candidateRows = await queryCandidates(useCursor ? resolvedDependencyWakeBackstopCandidateCursor : null);
     if (useCursor && candidateRows.length === 0 && resolvedDependencyWakeBackstopCandidateCursor) {
@@ -5234,8 +5312,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       for (const candidate of companyCandidates) {
         const agentId = candidate.assigneeAgentId;
-        if (!agentId) continue;
-
         const readiness = readinessMap.get(candidate.id);
         const resolvedBlockerIssueId = readiness?.blockerIssueIds[0] ?? null;
         if (
@@ -5247,6 +5323,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.notReadySkipped += 1;
           continue;
         }
+
+        const repairCandidate = async () => {
+          for (const blockerIssueId of readiness.blockerIssueIds) {
+            const unblocked = await issuesSvc.unblockResolvedBlockedDependents(
+              blockerIssueId,
+              db,
+              candidate.id,
+              false,
+            );
+            if (unblocked.some((dependent) => dependent.dependentIssueId === candidate.id)) return true;
+          }
+          return false;
+        };
 
         const idempotencyKeys = readiness.blockerIssueIds.map((blockerIssueId) =>
           buildIssueBlockersResolvedWakeIdempotencyKey({
@@ -5263,7 +5352,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           idempotencyKeys,
         });
         if (existingWake) {
+          await repairCandidate();
           result.existingWakeSkipped += 1;
+          continue;
+        }
+
+        if (!agentId) {
+          if (await repairCandidate()) {
+            result.healed += 1;
+            result.issueIds.push(candidate.id);
+            await logActivity(db, {
+              companyId,
+              actorType: "system",
+              actorId: "issue_graph_liveness_backstop",
+              agentId: null,
+              runId: opts?.runId ?? null,
+              action: "issue.blockers_resolved_wake_emitted",
+              entityType: "issue",
+              entityId: candidate.id,
+              details: {
+                source,
+                wakeupRunId: null,
+                idempotencyKey,
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+                stateRepair: true,
+              },
+            });
+          }
           continue;
         }
 
@@ -5284,6 +5400,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.pauseHoldSkipped += 1;
           continue;
         }
+
+        if (!(await repairCandidate())) continue;
 
         try {
           const wake = await deps.enqueueWakeup(agentId, {

@@ -2803,12 +2803,41 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
-  const svc = issueService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
+  });
+  const svc = issueService(db, {
+    onDependencyResolved: async (wakeup) => {
+      const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: wakeup.dependentIssueId,
+        resolvedBlockerIssueId: wakeup.blockerIssueId,
+      });
+      await heartbeat.wakeup(wakeup.dependentAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        payload: {
+          issueId: wakeup.dependentIssueId,
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+          mutation: "route_issue_service_update",
+        },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: {
+          issueId: wakeup.dependentIssueId,
+          taskId: wakeup.dependentIssueId,
+          wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          source: "issue.route_service_update",
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+        },
+      });
+    },
   });
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
@@ -9361,34 +9390,6 @@ export function issueRoutes(
       }
     }
     const enteringBlocked = existing.status !== "blocked" && updateFields.status === "blocked";
-    if (enteringBlocked) {
-      const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
-        ? [...new Set(req.body.blockedByIssueIds as string[])]
-        : null;
-      const hasUnresolvedBlocker = requestedBlockerIds
-        ? requestedBlockerIds.length > 0 && await db.select({ id: issueRows.id }).from(issueRows).where(and(
-          eq(issueRows.companyId, existing.companyId),
-          inArray(issueRows.id, requestedBlockerIds),
-          notInArray(issueRows.status, ["done", "cancelled"]),
-        )).limit(1).then((rows) => rows.length > 0)
-        : (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0;
-      const [pendingInteraction, pendingApproval] = await Promise.all([
-        db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
-          eq(issueThreadInteractions.companyId, existing.companyId),
-          eq(issueThreadInteractions.issueId, existing.id),
-          eq(issueThreadInteractions.status, "pending"),
-        )).limit(1).then((rows) => rows[0] ?? null),
-        db.select({ id: approvals.id }).from(issueApprovals).innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id)).where(and(
-          eq(issueApprovals.companyId, existing.companyId),
-          eq(issueApprovals.issueId, existing.id),
-          eq(approvals.status, "pending"),
-        )).limit(1).then((rows) => rows[0] ?? null),
-      ]);
-      if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !descriptor) {
-        res.status(422).json({ error: "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor" });
-        return;
-      }
-    }
     if (reviewRequest !== undefined && transition.patch.executionState === undefined) {
       const existingExecutionState = parseIssueExecutionState(existing.executionState);
       if (!existingExecutionState || existingExecutionState.status !== "pending") {
@@ -10391,6 +10392,7 @@ export function issueRoutes(
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
+          if (!dependent.assigneeAgentId) continue;
           await addDependencyResolvedWakeup({
             agentId: dependent.assigneeAgentId,
             dependentIssueId: dependent.id,
@@ -12422,6 +12424,7 @@ export function issueRoutes(
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(currentIssue.id);
         for (const dependent of dependents) {
+          if (!dependent.assigneeAgentId) continue;
           await addDependencyResolvedWakeup({
             agentId: dependent.assigneeAgentId,
             dependentIssueId: dependent.id,
