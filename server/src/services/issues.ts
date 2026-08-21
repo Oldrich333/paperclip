@@ -1271,10 +1271,9 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Both terminal statuses resolve a dependency. A cancelled blocker cannot
-    // make further progress, so keeping it unresolved permanently strands the
-    // dependent even though the dependency graph is no longer actionable.
-    if (row.blockerStatus !== "done" && row.blockerStatus !== "cancelled") {
+    // Only done blockers resolve dependents; cancelled blockers stay unresolved
+    // until an operator removes or replaces the blocker relationship explicitly.
+    if (row.blockerStatus !== "done") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -4456,6 +4455,37 @@ async function assertEnteringBlockedAllowed(
   if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !hasDescriptor) {
     throw unprocessable("Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor");
   }
+}
+
+async function hasPendingBlockedAttention(
+  dbOrTx: any,
+  companyId: string,
+  issueId: string,
+): Promise<boolean> {
+  const [pendingInteraction, pendingApproval] = await Promise.all([
+    dbOrTx
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, companyId),
+        eq(issueThreadInteractions.issueId, issueId),
+        inArray(issueThreadInteractions.status, BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES),
+      ))
+      .limit(1)
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+    dbOrTx
+      .select({ id: approvals.id })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(and(
+        eq(issueApprovals.companyId, companyId),
+        eq(issueApprovals.issueId, issueId),
+        inArray(approvals.status, BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES),
+      ))
+      .limit(1)
+      .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+  ]);
+  return Boolean(pendingInteraction || pendingApproval);
 }
 
 async function unblockResolvedBlockedDependents(
@@ -7898,6 +7928,27 @@ export function issueService(db: Db, options: IssueServiceOptions = {}) {
         if (receiptExisting.status !== "blocked" && issueData.status === "blocked") {
           await assertEnteringBlockedAllowed(tx, receiptExisting, issueData, blockedByIssueIds);
         }
+        const nextUnblockDescriptor = issueData.unblockDescriptor !== undefined
+          ? issueData.unblockDescriptor
+          : receiptExisting.unblockDescriptor;
+        const shouldAutoUnblockAfterClearingBlockers =
+          receiptExisting.status === "blocked" &&
+          blockedByIssueIds?.length === 0 &&
+          (issueData.status === undefined || issueData.status === "blocked") &&
+          nextUnblockDescriptor == null &&
+          !(await hasPendingBlockedAttention(tx, receiptExisting.companyId, receiptExisting.id));
+        if (shouldAutoUnblockAfterClearingBlockers) {
+          patch.status = "todo";
+          patch.unblockDescriptor = null;
+          patch.blockedTransitionAt = null;
+          patch.blockedOwnerNotifiedAt = null;
+          patch.checkoutRunId = null;
+          patch.executionRunId = null;
+          patch.executionAgentNameKey = null;
+          patch.executionLockedAt = null;
+          patch.completedAt = null;
+          patch.cancelledAt = null;
+        }
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])
@@ -8023,7 +8074,7 @@ export function issueService(db: Db, options: IssueServiceOptions = {}) {
             tx,
           );
         }
-        if (existing.status !== updated.status && (updated.status === "done" || updated.status === "cancelled")) {
+        if (existing.status !== updated.status && updated.status === "done") {
           const unblocked = await unblockResolvedBlockedDependents(tx, updated.id);
           for (const dependent of unblocked) {
             if (dependent.dependentAgentId) dependencyWakeups.push({

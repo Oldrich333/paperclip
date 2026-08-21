@@ -4194,7 +4194,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     { blockerStatus: "done" as const, assigned: false },
     { blockerStatus: "cancelled" as const, assigned: true },
     { blockerStatus: "cancelled" as const, assigned: false },
-  ])("unblocks a $blockerStatus blocker dependency for $assigned assigned dependents", async ({ blockerStatus, assigned }) => {
+  ])("handles a $blockerStatus blocker dependency for $assigned assigned dependents", async ({ blockerStatus, assigned }) => {
     const companyId = randomUUID();
     const assigneeAgentId = assigned ? randomUUID() : null;
     await db.insert(companies).values({
@@ -4236,7 +4236,44 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await expect(svc.getById(dependentId)).resolves.toMatchObject({
       id: dependentId,
+      status: blockerStatus === "done" ? "todo" : "blocked",
+    });
+    const readiness = await svc.getDependencyReadiness(dependentId);
+    expect(readiness).toMatchObject({
+      unresolvedBlockerCount: blockerStatus === "done" ? 0 : 1,
+      isDependencyReady: blockerStatus === "done",
+    });
+    if (blockerStatus === "cancelled") {
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+    }
+  });
+
+  it("repairs the stranded intermediate state when an operator clears the last blocker relation", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Done blocker", status: "done", priority: "medium" },
+      { id: dependentId, companyId, title: "Blocked dependent", status: "blocked", priority: "medium" },
+    ]);
+    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
+
+    await svc.update(dependentId, { blockedByIssueIds: [] });
+
+    await expect(svc.getById(dependentId)).resolves.toMatchObject({
+      id: dependentId,
       status: "todo",
+    });
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      unresolvedBlockerCount: 0,
+      isDependencyReady: true,
     });
   });
 
