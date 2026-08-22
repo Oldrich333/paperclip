@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -6495,6 +6495,97 @@ function isOpenRoutineExecutionLockConflict(error: unknown): boolean {
   return false;
 }
 
+const ROUTINE_EXECUTION_OPEN_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+] as const;
+
+async function routineExecutionLockHeldBySiblingIssue(
+  executor: Pick<Db, "select">,
+  issue: {
+    id: string;
+    companyId: string;
+    originKind: string | null;
+    originId: string | null;
+    originFingerprint: string | null;
+  },
+): Promise<boolean> {
+  if (issue.originKind !== "routine_execution" || !issue.originId || !issue.originFingerprint) {
+    return false;
+  }
+  const holder = await executor
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, issue.companyId),
+        eq(issues.originKind, "routine_execution"),
+        eq(issues.originId, issue.originId),
+        eq(issues.originFingerprint, issue.originFingerprint),
+        ne(issues.id, issue.id),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, [...ROUTINE_EXECUTION_OPEN_ISSUE_STATUSES]),
+        isNotNull(issues.executionRunId),
+      ),
+    )
+    .limit(1);
+  return holder.length > 0;
+}
+
+async function lockRoutineExecutionIdentityRows(
+  executor: Pick<Db, "execute">,
+  issue: {
+    companyId: string;
+    originKind: string | null;
+    originId: string | null;
+    originFingerprint: string | null;
+  },
+) {
+  if (issue.originKind !== "routine_execution" || !issue.originId || !issue.originFingerprint) {
+    return;
+  }
+  await executor.execute(sql`
+    select id from issues
+    where company_id = ${issue.companyId}
+      and origin_kind = 'routine_execution'
+      and origin_id = ${issue.originId}
+      and origin_fingerprint = ${issue.originFingerprint}
+      and hidden_at is null
+      and status in ('backlog', 'todo', 'in_progress', 'in_review', 'blocked')
+    order by id
+    for update
+  `);
+}
+
+async function abortQueuedRunPromotionAfterRoutineLockConflict(
+  executor: Pick<Db, "update">,
+  input: { queuedRunId: string; wakeupRequestId: string; now: Date },
+) {
+  const message = "Another open routine execution issue already holds this lane lock";
+  await executor
+    .update(heartbeatRuns)
+    .set({
+      status: "cancelled",
+      finishedAt: input.now,
+      error: message,
+      errorCode: "routine_execution_lock_contended",
+      updatedAt: input.now,
+    })
+    .where(eq(heartbeatRuns.id, input.queuedRunId));
+  await executor
+    .update(agentWakeupRequests)
+    .set({
+      status: "skipped",
+      finishedAt: input.now,
+      error: message,
+      updatedAt: input.now,
+    })
+    .where(eq(agentWakeupRequests.id, input.wakeupRequestId));
+}
+
 const defaultSessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
     const asObj = parseObject(raw);
@@ -10043,7 +10134,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
 
       const issue = await tx
-        .select({ id: issues.id })
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          originKind: issues.originKind,
+          originId: issues.originId,
+          originFingerprint: issues.originFingerprint,
+        })
         .from(issues)
         .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
         .then((rows) => rows[0] ?? null);
@@ -10096,6 +10193,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           updatedAt: now,
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+      await lockRoutineExecutionIdentityRows(tx, issue);
+      if (await routineExecutionLockHeldBySiblingIssue(tx, issue)) {
+        await abortQueuedRunPromotionAfterRoutineLockConflict(tx, {
+          queuedRunId: queuedRun.id,
+          wakeupRequestId: wakeupRequest.id,
+          now,
+        });
+        return null;
+      }
 
       await tx
         .update(issues)
@@ -17430,6 +17537,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
 
+        await lockRoutineExecutionIdentityRows(tx, issue);
+        if (await routineExecutionLockHeldBySiblingIssue(tx, issue)) {
+          await abortQueuedRunPromotionAfterRoutineLockConflict(tx, {
+            queuedRunId: newRun.id,
+            wakeupRequestId: deferred.id,
+            now,
+          });
+          return { kind: "released" as const };
+        }
+
         await tx
           .update(issues)
           .set({
@@ -17588,6 +17705,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             updatedAt: now,
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+        if (await routineExecutionLockHeldBySiblingIssue(tx, issue)) {
+          await abortQueuedRunPromotionAfterRoutineLockConflict(tx, {
+            queuedRunId: queuedRun.id,
+            wakeupRequestId: wakeupRequest.id,
+            now,
+          });
+          return { kind: "released" as const };
+        }
 
         await tx
           .update(issues)
@@ -17750,6 +17876,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           updatedAt: now,
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+      await lockRoutineExecutionIdentityRows(tx, issue);
+      if (await routineExecutionLockHeldBySiblingIssue(tx, issue)) {
+        await abortQueuedRunPromotionAfterRoutineLockConflict(tx, {
+          queuedRunId: queuedRun.id,
+          wakeupRequestId: wakeupRequest.id,
+          now,
+        });
+        return { kind: "released" as const };
+      }
 
       await tx
         .update(issues)
