@@ -2510,7 +2510,11 @@ export function agentRoutes(
       action: "agent.runtime_session_reset",
       entityType: "agent",
       entityId: id,
-      details: { taskKey: taskKey ?? null },
+      details: {
+        taskKey: taskKey ?? null,
+        clearedTaskSessions: state?.clearedTaskSessions ?? 0,
+        resetAcpxSessions: state?.resetAcpxSessions ?? 0,
+      },
     });
 
     res.json(state);

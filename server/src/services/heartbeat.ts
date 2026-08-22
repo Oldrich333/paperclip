@@ -93,6 +93,7 @@ import type {
   AdapterSessionCodec,
   UsageSummary,
 } from "../adapters/index.js";
+import { markAcpxSessionsForReset } from "@paperclipai/adapter-utils/acpx-engine/session-store";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
@@ -101,7 +102,11 @@ import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
-import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import {
+  resolveDefaultAgentWorkspaceDir,
+  resolveManagedProjectWorkspaceDir,
+  resolvePaperclipInstanceRoot,
+} from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
@@ -3151,6 +3156,21 @@ export function buildReferencedProjectRunObservability(input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function resolveAcpxStateDir(agent: Pick<typeof agents.$inferSelect, "companyId" | "id" | "adapterConfig">): string {
+  const configuredStateDir = readNonEmptyString(parseObject(agent.adapterConfig).stateDir);
+  return path.resolve(
+    configuredStateDir ??
+      path.join(
+        resolvePaperclipInstanceRoot(),
+        "companies",
+        agent.companyId,
+        "acp-engine",
+        "agents",
+        agent.id,
+      ),
+  );
 }
 
 function sanitizeAgentSessionMessageText(value: unknown): string | null {
@@ -18824,6 +18844,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!agent) throw notFound("Agent not found");
       await ensureRuntimeState(agent);
       const taskKey = readNonEmptyString(opts?.taskKey);
+      const acpxSessionKeyPrefix = `paperclip:${agent.companyId}:${agent.id}:${taskKey ?? ""}`;
+      const resetAcpxSessions = await markAcpxSessionsForReset({
+        stateDir: resolveAcpxStateDir(agent),
+        sessionKeyPrefix: acpxSessionKeyPrefix,
+      });
       const clearedTaskSessions = await clearTaskSessions(
         agent.companyId,
         agent.id,
@@ -18851,6 +18876,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sessionDisplayId: null,
         sessionParamsJson: null,
         clearedTaskSessions,
+        resetAcpxSessions,
       };
     },
 
