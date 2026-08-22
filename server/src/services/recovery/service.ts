@@ -30,7 +30,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { conflict, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
@@ -5756,6 +5756,239 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { terminalized: true, status: updated.status };
   }
 
+  // Agent self-service for the one recovery case that the standard sweeper
+  // cannot serve synchronously: an active issue still points at a run whose
+  // process disappeared before the run was terminalized. This is deliberately
+  // narrower than operator cancel or force-release. It never terminates a
+  // process and every mutation is guarded by the issue/run row locks plus a
+  // compare-and-set on the expected running status and lock columns.
+  async function clearProcessLostIssueLock(input: {
+    companyId: string;
+    issueId: string;
+    targetRunId: string;
+    actorAgentId: string;
+    actorRunId: string;
+    agentApiKeyId?: string | null;
+  }) {
+    return db.transaction(async (tx) => {
+      const issue = await tx
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+
+      const clearsCheckout = issue.checkoutRunId === input.targetRunId;
+      const clearsExecution = issue.executionRunId === input.targetRunId;
+      const hasExactTarget = clearsCheckout || clearsExecution;
+
+      const actorRun = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, input.actorRunId),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.actorAgentId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!actorRun) throw conflict("Agent run context not found");
+
+      const run = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, input.targetRunId), eq(heartbeatRuns.companyId, input.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+
+      // A prior clear or FK cleanup already removed the exact target. Return a
+      // readback rather than making agents retry a successful recovery.
+      if (!hasExactTarget || !run) {
+        return {
+          outcome: "already_cleared" as const,
+          issueId: issue.id,
+          targetRunId: input.targetRunId,
+          issue: {
+            id: issue.id,
+            checkoutRunId: issue.checkoutRunId,
+            executionRunId: issue.executionRunId,
+          },
+          run: run
+            ? { id: run.id, status: run.status, errorCode: run.errorCode, finishedAt: run.finishedAt }
+            : null,
+          clearedCheckoutRunId: null,
+          clearedExecutionRunId: null,
+        };
+      }
+
+      if (run.agentId !== input.actorAgentId && issue.assigneeAgentId !== input.actorAgentId) {
+        throw forbidden("Only the referenced run agent or current issue assignee can clear a process-lost lock");
+      }
+      if (run.id === input.actorRunId) {
+        throw conflict("Process-lost clear requires a later agent run than the locked run");
+      }
+
+      const now = new Date();
+      let updatedRun = run;
+      let outcome: "cleared" | "already_terminal";
+
+      if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+        // Terminal rows are safe to clean up and make retries idempotent. This
+        // is the same cleanup state the standard sweeper produces; no run
+        // status is changed here.
+        outcome = "already_terminal";
+      } else {
+        if (run.status !== "running") {
+          throw conflict("Process-lost clear requires a running heartbeat run", { status: run.status });
+        }
+
+        const inMemory = runningProcesses.get(run.id);
+        const pid = run.processPid ?? null;
+        const processGroupId = run.processGroupId ?? null;
+        if (inMemory) {
+          throw conflict("Process-lost clear rejected while an in-memory process handle exists", {
+            targetRunId: run.id,
+          });
+        }
+        if (typeof pid !== "number" && typeof processGroupId !== "number") {
+          throw conflict("Process-lost clear requires recorded process metadata", { targetRunId: run.id });
+        }
+        const processAlive =
+          (typeof pid === "number" && isPidAlive(pid)) ||
+          (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
+        if (processAlive) {
+          throw conflict("Process-lost clear rejected while the recorded process is alive", {
+            targetRunId: run.id,
+            pid,
+            processGroupId,
+          });
+        }
+
+        const processLostMessage =
+          "run interrupted by agent recovery: recorded process and process group are no longer alive";
+        const terminalized = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "interrupted",
+            finishedAt: run.finishedAt ?? now,
+            error: run.error ?? processLostMessage,
+            errorCode: run.errorCode ?? "orphaned_running_run",
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(heartbeatRuns.id, run.id),
+              eq(heartbeatRuns.companyId, input.companyId),
+              eq(heartbeatRuns.status, "running"),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!terminalized) {
+          throw conflict("Process-lost clear lost the heartbeat run race");
+        }
+        updatedRun = terminalized;
+        outcome = "cleared";
+        runningProcesses.delete(run.id);
+      }
+
+      const updatedIssue = await tx
+        .update(issues)
+        .set({
+          checkoutRunId: clearsCheckout ? null : issue.checkoutRunId,
+          executionRunId: clearsExecution ? null : issue.executionRunId,
+          executionAgentNameKey: clearsExecution ? null : issue.executionAgentNameKey,
+          executionLockedAt: clearsExecution ? null : issue.executionLockedAt,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.id, issue.id),
+            eq(issues.companyId, input.companyId),
+            issue.checkoutRunId
+              ? eq(issues.checkoutRunId, issue.checkoutRunId)
+              : isNull(issues.checkoutRunId),
+            issue.executionRunId
+              ? eq(issues.executionRunId, issue.executionRunId)
+              : isNull(issues.executionRunId),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updatedIssue) {
+        throw conflict("Process-lost clear lost the issue lock race");
+      }
+
+      const [maxSeqRow] = await tx
+        .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, run.id));
+      await tx.insert(heartbeatRunEvents).values({
+        companyId: input.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        seq: Number(maxSeqRow?.maxSeq ?? 0) + 1,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "run lock cleared by agent after process loss",
+        payload: {
+          source: "agent.process_lost_clear",
+          issueId: issue.id,
+          actorAgentId: input.actorAgentId,
+          actorRunId: input.actorRunId,
+          previousStatus: run.status,
+          terminalStatus: updatedRun.status,
+          errorCode: updatedRun.errorCode,
+          clearedCheckoutRunId: clearsCheckout ? input.targetRunId : null,
+          clearedExecutionRunId: clearsExecution ? input.targetRunId : null,
+          processPid: run.processPid,
+          processGroupId: run.processGroupId,
+        },
+      });
+      await logActivity(tx as unknown as Db, {
+        companyId: input.companyId,
+        actorType: "agent",
+        actorId: input.actorAgentId,
+        agentId: input.actorAgentId,
+        runId: input.actorRunId,
+        agentApiKeyId: input.agentApiKeyId ?? null,
+        action: "issue.process_lost_lock_cleared",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          source: "agent.process_lost_clear",
+          targetRunId: input.targetRunId,
+          targetRunStatus: updatedRun.status,
+          targetRunErrorCode: updatedRun.errorCode,
+          clearedCheckoutRunId: clearsCheckout ? input.targetRunId : null,
+          clearedExecutionRunId: clearsExecution ? input.targetRunId : null,
+          actorRunId: input.actorRunId,
+        },
+      });
+
+      return {
+        outcome,
+        issueId: issue.id,
+        targetRunId: input.targetRunId,
+        issue: {
+          id: updatedIssue.id,
+          checkoutRunId: updatedIssue.checkoutRunId,
+          executionRunId: updatedIssue.executionRunId,
+        },
+        run: {
+          id: updatedRun.id,
+          status: updatedRun.status,
+          errorCode: updatedRun.errorCode,
+          finishedAt: updatedRun.finishedAt,
+        },
+        clearedCheckoutRunId: clearsCheckout ? input.targetRunId : null,
+        clearedExecutionRunId: clearsExecution ? input.targetRunId : null,
+      };
+    });
+  }
+
   // Backstop sweeper: clears stale lock columns on issues whose checkoutRunId
   // or executionRunId points at a heartbeat_runs row that is either missing or
   // in a terminal status. Provides self-heal for stale locks that fell outside
@@ -5928,6 +6161,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    clearProcessLostIssueLock,
     sweepStaleIssueLocks,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,

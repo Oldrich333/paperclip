@@ -263,6 +263,9 @@ function prefersMinimalIssueUpdateResponse(req: Request) {
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
+const clearProcessLostIssueLockSchema = z.object({
+  runId: z.string().uuid(),
+}).strict();
 const inboxArchiveBodySchema = z.object({
   userId: z.string().trim().min(1).optional(),
 }).strict().default({});
@@ -6895,6 +6898,28 @@ export function issueRoutes(
       },
       recoveryAction: result.recoveryAction,
     });
+  });
+
+  router.post("/issues/:id/process-lost-clear", validate(clearProcessLostIssueLockSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId) {
+      res.status(403).json({ error: "Agent access required" });
+      return;
+    }
+    const actorRunId = requireAgentRunId(req, res);
+    if (!actorRunId) return;
+
+    const result = await heartbeat.clearProcessLostIssueLock({
+      companyId: issue.companyId,
+      issueId: issue.id,
+      targetRunId: req.body.runId,
+      actorAgentId: req.actor.agentId,
+      actorRunId,
+      agentApiKeyId: req.actor.keyId ?? null,
+    });
+    res.json(result);
   });
 
   router.get("/issues/:id/work-products", async (req, res) => {

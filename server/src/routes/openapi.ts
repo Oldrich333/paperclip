@@ -6909,6 +6909,14 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "post",
+  path: "/api/issues/{id}/process-lost-clear",
+  tags: ["issues"],
+  summary: "Clear an exact process-lost issue lock as an agent",
+  body: z.object({ runId: z.string().uuid() }).strict(),
+});
+
+registerCurrentRoute({
+  method: "post",
   path: "/api/issues/{id}/recovery-actions/resolve",
   tags: ["issues"],
   summary: "Resolve an issue recovery action",

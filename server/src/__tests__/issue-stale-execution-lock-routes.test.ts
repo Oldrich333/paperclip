@@ -8,6 +8,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRelations,
@@ -19,6 +20,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { runningProcesses } from "../adapters/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -44,6 +46,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -479,6 +482,317 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         clearAssignee: true,
       },
     });
+  });
+
+  it("gives agents an audited exact-target process-lost clear and keeps cancel board-only", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const targetRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: targetRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      processPid: 2_000_000_000,
+      processGroupId: null,
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Process-lost execution lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: targetRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    const board = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: targetRunId });
+    expect(board.status, JSON.stringify(board.body)).toBe(403);
+
+    const cleared = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: targetRunId });
+    expect(cleared.status, JSON.stringify(cleared.body)).toBe(200);
+    expect(cleared.body).toMatchObject({
+      outcome: "cleared",
+      issueId,
+      targetRunId,
+      issue: { checkoutRunId: null, executionRunId: null },
+      run: { id: targetRunId, status: "interrupted", errorCode: "orphaned_running_run" },
+      clearedExecutionRunId: targetRunId,
+    });
+
+    const resumed = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .set("X-Paperclip-Run-Id", currentRunId)
+      .send({ title: "Execution lock recovered" });
+    expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
+
+    const [event] = await db
+      .select({ eventType: heartbeatRunEvents.eventType, message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, targetRunId));
+    expect(event).toMatchObject({
+      eventType: "lifecycle",
+      message: "run lock cleared by agent after process loss",
+      payload: { source: "agent.process_lost_clear", issueId, actorRunId: currentRunId },
+    });
+    const [audit] = await db
+      .select({ action: activityLog.action, actorType: activityLog.actorType, actorId: activityLog.actorId, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.process_lost_lock_cleared"));
+    expect(audit).toMatchObject({
+      action: "issue.process_lost_lock_cleared",
+      actorType: "agent",
+      actorId: agentId,
+      details: { source: "agent.process_lost_clear", targetRunId, actorRunId: currentRunId },
+    });
+  });
+
+  it.each([
+    { name: "live pid", processPid: process.pid, processGroupId: null },
+    { name: "pidless", processPid: null, processGroupId: null },
+  ])("rejects process-lost clear for $name or ambiguous process evidence", async ({ processPid, processGroupId }) => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const targetRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: targetRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      processPid,
+      processGroupId,
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Protected live lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: targetRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: targetRunId });
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+
+    const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, targetRunId));
+    const [issue] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId));
+    expect(run?.status).toBe("running");
+    expect(issue?.executionRunId).toBe(targetRunId);
+  });
+
+  it("rejects a process-lost clear while an in-memory process handle exists", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const targetRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: targetRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      processPid: 2_000_000_000,
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In-memory lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: targetRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    runningProcesses.set(targetRunId, {
+      child: { pid: process.pid } as any,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    try {
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/process-lost-clear`)
+        .send({ runId: targetRunId });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+    } finally {
+      runningProcesses.delete(targetRunId);
+    }
+  });
+
+  it("rejects an unrelated agent but lets the current assignee clear a foreign dead run", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const assigneeAgentId = randomUUID();
+    const assigneeRunId = randomUUID();
+    const unrelatedAgentId = randomUUID();
+    const unrelatedRunId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "AssigneeAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: unrelatedAgentId,
+        companyId,
+        name: "UnrelatedAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: assigneeRunId,
+        companyId,
+        agentId: assigneeAgentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      },
+      {
+        id: unrelatedRunId,
+        companyId,
+        agentId: unrelatedAgentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      },
+    ]);
+    const targetRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: targetRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      processPid: 2_000_000_000,
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Foreign dead lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId,
+      executionRunId: targetRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const wrong = await request(createApp(agentActor(companyId, unrelatedAgentId, unrelatedRunId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: targetRunId });
+    expect(wrong.status, JSON.stringify(wrong.body)).toBe(403);
+
+    const assignee = await request(createApp(agentActor(companyId, assigneeAgentId, assigneeRunId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: targetRunId });
+    expect(assignee.status, JSON.stringify(assignee.body)).toBe(200);
+    expect(assignee.body.outcome).toBe("cleared");
+  });
+
+  it("is idempotent for terminal and missing exact targets", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const first = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: failedRunId });
+    const second = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: failedRunId });
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body.outcome).toBe("already_terminal");
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    expect(second.body.outcome).toBe("already_cleared");
+
+    const missing = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/process-lost-clear`)
+      .send({ runId: randomUUID() });
+    expect(missing.status, JSON.stringify(missing.body)).toBe(200);
+    expect(missing.body.outcome).toBe("already_cleared");
+  });
+
+  it("serializes concurrent clears and emits one audit event", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const targetRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: targetRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      processPid: 2_000_000_000,
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Concurrent dead lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: targetRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const results = await Promise.all([
+      request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/process-lost-clear`)
+        .send({ runId: targetRunId }),
+      request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/process-lost-clear`)
+        .send({ runId: targetRunId }),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual([200, 200]);
+    expect(results.map((result) => result.body.outcome).sort()).toEqual(["already_cleared", "cleared"]);
+
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, targetRunId));
+    const audits = await db.select().from(activityLog).where(eq(activityLog.action, "issue.process_lost_lock_cleared"));
+    expect(events).toHaveLength(1);
+    expect(audits).toHaveLength(1);
   });
 
   it("self-heals a stale checkoutRunId via clearCheckoutRunIfTerminal on checkout (Fix B path)", async () => {

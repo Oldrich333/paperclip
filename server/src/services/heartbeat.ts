@@ -13752,6 +13752,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.sweepStaleIssueLocks();
   }
 
+  async function clearProcessLostIssueLock(input: Parameters<typeof recovery.clearProcessLostIssueLock>[0]) {
+    return recovery.clearProcessLostIssueLock(input);
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -19553,6 +19557,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     releaseEnvironmentLeasesForRun,
 
     sweepStaleIssueLocks,
+
+    clearProcessLostIssueLock,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
