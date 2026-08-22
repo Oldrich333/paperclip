@@ -17,6 +17,7 @@ import {
   type EnvironmentLeaseStatus,
   type ExecutionWorkspace,
   type ExecutionWorkspaceConfig,
+  type HeartbeatRunStatus,
   type HeartbeatRunStatusPhase,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
@@ -27,6 +28,10 @@ import {
   type RunLivenessState,
   type SourceTrustMetadata,
 } from "@paperclipai/shared";
+import {
+  HEARTBEAT_RUN_LIST_DEFAULT_LIMIT,
+  HEARTBEAT_RUN_LIST_MAX_LIMIT,
+} from "@paperclipai/shared/constants";
 import {
   agents,
   agentConfigRevisions,
@@ -18714,10 +18719,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean; statuses?: HeartbeatRunStatus[] } = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
+      const effectiveLimit = Math.max(
+        1,
+        Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, limit ?? HEARTBEAT_RUN_LIST_DEFAULT_LIMIT),
+      );
+      const statusFilter = options.statuses?.length ? options.statuses : undefined;
+      const conditions = [eq(heartbeatRuns.companyId, companyId)];
+      if (agentId) conditions.push(eq(heartbeatRuns.agentId, agentId));
+      if (statusFilter) conditions.push(inArray(heartbeatRuns.status, statusFilter));
+
       const query = db
         .select(
           summary
@@ -18738,14 +18752,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId))
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(and(...conditions))
         .orderBy(desc(heartbeatRuns.createdAt));
 
-      const rows = limit ? await query.limit(limit) : await query;
+      const rows = await query.limit(effectiveLimit);
       return rows.map((row) => {
         const {
           contextIssueId,

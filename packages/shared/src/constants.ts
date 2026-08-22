@@ -860,6 +860,8 @@ export const HEARTBEAT_RUN_STATUSES = [
   "timed_out",
 ] as const;
 export type HeartbeatRunStatus = (typeof HEARTBEAT_RUN_STATUSES)[number];
+export const HEARTBEAT_RUN_LIST_DEFAULT_LIMIT = 200;
+export const HEARTBEAT_RUN_LIST_MAX_LIMIT = 1000;
 
 export const RUN_LIVENESS_STATES = [
   "completed",

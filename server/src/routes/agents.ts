@@ -21,6 +21,7 @@ import {
   type AgentSkillAssignmentMode,
   type AgentSkillSnapshot,
   type InstanceSchedulerHeartbeatAgent,
+  type HeartbeatRunStatus,
   upsertAgentInstructionsFileSchema,
   updateAgentInstructionsBundleSchema,
   updateAgentPermissionsSchema,
@@ -30,6 +31,11 @@ import {
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
 } from "@paperclipai/shared";
+import {
+  HEARTBEAT_RUN_LIST_DEFAULT_LIMIT,
+  HEARTBEAT_RUN_LIST_MAX_LIMIT,
+  HEARTBEAT_RUN_STATUSES,
+} from "@paperclipai/shared/constants";
 import {
   isForbiddenConfigEnvKey,
   parseObject,
@@ -161,6 +167,30 @@ function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
   if (!Number.isFinite(parsed)) return fallback;
   if (parsed <= 0) return fallback;
   return Math.min(max, Math.trunc(parsed));
+}
+
+function readHeartbeatRunListLimit(value: unknown) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return HEARTBEAT_RUN_LIST_DEFAULT_LIMIT;
+  return Math.max(1, Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, Math.trunc(parsed)));
+}
+
+function readHeartbeatRunStatusFilter(value: unknown): HeartbeatRunStatus[] | undefined {
+  const rawValues = Array.isArray(value)
+    ? value.flatMap((entry) => String(entry).split(","))
+    : typeof value === "string"
+      ? value.split(",")
+      : [];
+  const statuses = rawValues.map((entry) => entry.trim()).filter(Boolean);
+  if (statuses.length === 0) return undefined;
+
+  const allowed = new Set<string>(HEARTBEAT_RUN_STATUSES);
+  const invalid = statuses.filter((status) => !allowed.has(status));
+  if (invalid.length > 0) {
+    throw badRequest(`Invalid heartbeat run status filter: ${invalid.join(", ")}`);
+  }
+
+  return statuses as HeartbeatRunStatus[];
 }
 
 function readRunIssueId(context: Record<string, unknown> | null) {
@@ -3777,10 +3807,10 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const agentId = req.query.agentId as string | undefined;
-    const limitParam = req.query.limit as string | undefined;
-    const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
+    const limit = readHeartbeatRunListLimit(req.query.limit);
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const runs = await heartbeat.list(companyId, agentId, limit, { summary });
+    const statuses = readHeartbeatRunStatusFilter(req.query.status);
+    const runs = await heartbeat.list(companyId, agentId, limit, { summary, statuses });
     res.json(await Promise.all(runs.map((run) => runRedactions.redactForRun(companyId, run.id, run))));
   });
 

@@ -101,6 +101,104 @@ describeEmbeddedPostgres("heartbeat list", () => {
     }
   });
 
+  it("bounds list results to the default recent window when limit is omitted", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    for (let index = 0; index < 5; index += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "succeeded",
+        createdAt: new Date(`2026-04-18T12:${String(index).padStart(2, "0")}:00Z`),
+      });
+    }
+
+    const runs = await heartbeatService(db).list(companyId);
+    expect(runs).toHaveLength(5);
+  });
+
+  it("filters list results by terminal status", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const failedRunId = randomUUID();
+    const timedOutRunId = randomUUID();
+    const succeededRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "failed",
+        createdAt: new Date("2026-04-18T12:03:00Z"),
+      },
+      {
+        id: timedOutRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "timed_out",
+        createdAt: new Date("2026-04-18T12:02:00Z"),
+      },
+      {
+        id: succeededRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "succeeded",
+        createdAt: new Date("2026-04-18T12:01:00Z"),
+      },
+    ]);
+
+    const runs = await heartbeatService(db).list(companyId, undefined, 10, {
+      statuses: ["failed", "timed_out"],
+    });
+
+    expect(runs.map((run) => run.id)).toEqual([failedRunId, timedOutRunId]);
+  });
+
   it("returns small result json payloads unchanged from getRun", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
