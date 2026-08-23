@@ -6246,6 +6246,132 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
+  it("re-enqueues continuation when a terminal succeeded run left in_progress without run linkage", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "empty_response",
+    });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+      })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.successfulContinuationObserved).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.contextSnapshot as Record<string, unknown>).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      retryOfRunId: runId,
+      source: "issue.unlinkage_terminal_continuation_recovery",
+    });
+  });
+
+  it("enqueues continuation after process-lost clear when no other live run owns the issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const targetRunId = randomUUID();
+    const actorRunId = randomUUID();
+    const otherIssueId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date("2026-03-19T00:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: targetRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        processPid: 2_000_000_000,
+        processGroupId: null,
+        contextSnapshot: { issueId, taskId: issueId },
+        startedAt: now,
+      },
+      {
+        id: actorRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        contextSnapshot: { issueId: otherIssueId, taskId: otherIssueId },
+        startedAt: now,
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Process-lost lock without live owner",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionRunId: targetRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: now,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.clearProcessLostIssueLock({
+      companyId,
+      issueId,
+      targetRunId,
+      actorAgentId: agentId,
+      actorRunId,
+    });
+    expect(result.outcome).toBe("cleared");
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(3);
+    const continuationRun = runs.find((row) => row.id !== targetRunId && row.id !== actorRunId);
+    expect(continuationRun?.contextSnapshot as Record<string, unknown>).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      retryOfRunId: targetRunId,
+      source: "issue.process_lost_clear_continuation",
+    });
+  });
+
   it("classifies actionable plan-only recovery and enqueues one liveness continuation", async () => {
     mockAdapterExecute.mockResolvedValueOnce({
       exitCode: 0,

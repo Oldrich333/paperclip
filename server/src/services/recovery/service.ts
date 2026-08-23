@@ -1151,6 +1151,44 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(comment || attachment);
   }
 
+  async function tryEnqueueContinuationAfterRunLockRelease(input: {
+    companyId: string;
+    issueId: string;
+    sourceRunId: string;
+    source: string;
+  }) {
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return null;
+    if (issue.status !== "todo" && issue.status !== "in_progress") return null;
+    if (issue.assigneeUserId || !issue.assigneeAgentId) return null;
+    if (issue.checkoutRunId || issue.executionRunId) return null;
+
+    const agentId = issue.assigneeAgentId;
+    const agent = await getAgent(agentId);
+    if (!agent || !await isAgentInvokable(agent)) return null;
+    if (await hasActiveExecutionPath(input.companyId, input.issueId, agentId)) return null;
+    if (await hasQueuedIssueWake(input.companyId, input.issueId, agentId)) return null;
+    if (await hasPendingWakeInteraction(input.companyId, input.issueId)) return null;
+    if (await isInvocationBudgetBlocked(issue, agentId)) return null;
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, input.companyId, input.issueId, treeControlSvc)) {
+      return null;
+    }
+
+    const isTodo = issue.status === "todo";
+    return enqueueStrandedIssueRecovery({
+      issueId: issue.id,
+      agentId,
+      reason: isTodo ? "issue_assignment_recovery" : "issue_continuation_needed",
+      retryReason: isTodo ? "assignment_recovery" : "issue_continuation_needed",
+      source: input.source,
+      retryOfRunId: input.sourceRunId,
+    });
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -4196,6 +4234,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         const successfulRun = latestRun;
 
         if (!isProductiveContinuationRun(successfulRun)) {
+          const linkageReleased = !issue.checkoutRunId && !issue.executionRunId;
+          if (linkageReleased) {
+            if (await isInvocationBudgetBlocked(issue, agentId)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            const queued = await enqueueStrandedIssueRecovery({
+              issueId: issue.id,
+              agentId,
+              reason: "issue_continuation_needed",
+              retryReason: "issue_continuation_needed",
+              source: "issue.unlinkage_terminal_continuation_recovery",
+              retryOfRunId: successfulRun.id,
+            });
+            if (queued) {
+              result.continuationRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
           result.successfulContinuationObserved += 1;
           result.skipped += 1;
           continue;
@@ -5770,7 +5832,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     actorRunId: string;
     agentApiKeyId?: string | null;
   }) {
-    return db.transaction(async (tx) => {
+    const txResult = await db.transaction(async (tx) => {
       const issue = await tx
         .select()
         .from(issues)
@@ -5987,6 +6049,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         clearedExecutionRunId: clearsExecution ? input.targetRunId : null,
       };
     });
+
+    if (txResult.outcome === "cleared" || txResult.outcome === "already_terminal") {
+      await tryEnqueueContinuationAfterRunLockRelease({
+        companyId: input.companyId,
+        issueId: txResult.issueId,
+        sourceRunId: txResult.targetRunId,
+        source: "issue.process_lost_clear_continuation",
+      });
+    }
+
+    return txResult;
   }
 
   // Backstop sweeper: clears stale lock columns on issues whose checkoutRunId
