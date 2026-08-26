@@ -845,6 +845,7 @@ function toToolInvocation(row: typeof toolInvocations.$inferSelect): ToolInvocat
     upstreamRequestId: row.upstreamRequestId,
     resultHash: row.resultHash,
     resultSummary: row.resultSummary ?? null,
+    resultPayload: row.resultPayload ?? null,
     resultSizeBytes: row.resultSizeBytes,
     resultArtifactId: row.resultArtifactId,
     errorCode: row.errorCode,
@@ -2962,6 +2963,80 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         .where(eq(toolRuntimeSlots.connectionId, connection.id));
     }
     return updated;
+  }
+
+  async function assertAgentCanHealthCheckConnection(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    connection: typeof toolConnections.$inferSelect;
+  }) {
+    const runContext = await loadBrokerRunContext({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      runId: input.runId,
+    });
+    const application = await getConnectionApplication(input.connection);
+    const catalogEntries = await db
+      .select()
+      .from(toolCatalogEntries)
+      .where(and(
+        eq(toolCatalogEntries.companyId, input.companyId),
+        eq(toolCatalogEntries.connectionId, input.connection.id),
+        eq(toolCatalogEntries.status, "active"),
+      ));
+    if (catalogEntries.length === 0) {
+      throw forbidden("Connection has no active catalog entries");
+    }
+    for (const entry of catalogEntries) {
+      const decisionInput = {
+        companyId: input.companyId,
+        actor: {
+          actorType: "agent" as const,
+          actorId: input.agentId,
+          agentId: input.agentId,
+        },
+        runContext: {
+          heartbeatRunId: input.runId,
+          issueId: runContext.issueId,
+          projectId: runContext.projectId,
+          routineId: runContext.routineId,
+        },
+        request: {
+          applicationId: input.connection.applicationId,
+          applicationKey: application?.applicationKey ?? null,
+          connectionId: input.connection.id,
+          catalogEntryId: entry.id,
+          providerType: input.connection.transport === "local_stdio" ? "mcp_local_stdio" : "mcp_remote_http",
+          upstreamToolName: entry.toolName,
+          toolName: entry.name,
+          riskLevel: entry.riskLevel,
+          arguments: {},
+        },
+      };
+      const decision = await policySvc.decide(decisionInput);
+      if (decision.allowed) {
+        await policySvc.writeAudit(decisionInput, decision);
+        return;
+      }
+    }
+    throw forbidden("Agent has no governed access to health-check this connection");
+  }
+
+  async function checkHealthForAgent(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    connectionId: string;
+  }): Promise<ToolConnectionHealthCheckResult> {
+    const connection = await getConnectionRow(input.connectionId, input.companyId);
+    await assertAgentCanHealthCheckConnection({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      runId: input.runId,
+      connection,
+    });
+    return checkConnectionHealth(connection.id, { actorType: "agent", actorId: input.agentId });
   }
 
   async function checkConnectionHealth(connectionId: string, actor?: ActorInfo): Promise<ToolConnectionHealthCheckResult> {
@@ -6606,6 +6681,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     },
 
     checkHealth: checkConnectionHealth,
+
+    checkHealthForAgent,
 
     refreshCatalog,
 

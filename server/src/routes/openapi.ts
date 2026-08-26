@@ -526,6 +526,10 @@ const responses = {
     description: "Internal server error",
     content: { "application/json": { schema: ErrorSchema } },
   },
+  badGateway: {
+    description: "Bad gateway",
+    content: { "application/json": { schema: ErrorSchema } },
+  },
   tooManyRequests: {
     description: "Too many requests",
     content: { "application/json": { schema: ErrorSchema } },
@@ -851,6 +855,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/tool-connections/{connectionId}/test-calls/{actionRequestId}",
   "POST /api/agents/me/connections/{connectionId}/start-authorization",
   "POST /api/agents/me/connections/{connectionId}/token",
+  "POST /api/agents/me/connections/{connectionId}/health-check",
   "POST /api/tools/oauth/{connectionId}/start",
   "GET /api/tools/oauth/callback",
   "GET /api/companies/{companyId}/tools/profiles",
@@ -1776,6 +1781,15 @@ registry.registerPath({
     body: jsonBody(connectionTokenRequestSchema),
   },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 429: r.tooManyRequests },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/me/connections/{connectionId}/health-check",
+  tags: ["tools"],
+  summary: "Run a governed tool-connection health check for the authenticated agent",
+  request: { params: z.object({ connectionId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 502: r.badGateway },
 });
 
 registry.registerPath({

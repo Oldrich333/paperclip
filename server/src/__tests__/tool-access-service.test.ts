@@ -542,6 +542,82 @@ describeEmbeddedPostgres("tool access service", () => {
     ]));
   });
 
+  it("lets governed agents health-check connections they can use", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `health-fixture-${randomUUID()}`,
+      name: `Health fixture ${randomUUID()}`,
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: `Health fixture connection ${randomUUID()}`,
+      uid: `test/${randomUUID()}`,
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      healthStatus: "error",
+      healthMessage: "Remote MCP tool call timed out.",
+      config: { url: "https://health-fixture.example.test/mcp" },
+      transportConfig: { url: "https://health-fixture.example.test/mcp" },
+    }).returning();
+    await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      connectionId: connection!.id,
+      entryKind: "tool",
+      name: "machine.command.run",
+      toolName: "machine.command.run",
+      status: "active",
+      riskLevel: "read",
+      isReadOnly: true,
+      isWrite: false,
+      isDestructive: false,
+    });
+    await allowConnectionForAgent(db, company.id, agent.id, connection!.id, { brokerMint: false });
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      if (String(url) === "https://health-fixture.example.test/mcp") {
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: "paperclip-health-check",
+          result: { tools: [{ name: "machine.command.run", annotations: { readOnlyHint: true } }] },
+        });
+      }
+      throw new Error(`unexpected fetch ${String(url)}`);
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${connection!.id}/health-check`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.connection.healthStatus).toBe("ok");
+    fetchMock.mockRestore();
+  });
+
+  it("rejects agent JWT on the board tool-connection health-check route", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createBrokerConnection(db, company.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    const res = await request(app)
+      .post(`/api/tool-connections/${connection.id}/health-check`)
+      .set("X-Paperclip-Run-Id", run.id)
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Board access required");
+  });
+
   it("selects scoped credentials for array scopes and fails closed for unknown selectors", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

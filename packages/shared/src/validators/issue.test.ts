@@ -48,6 +48,16 @@ describe("issue validators", () => {
       .toBeUndefined();
   });
 
+  it("preserves omitted patch fields and accepts explicit blocker clearing", () => {
+    const omitted = updateIssueSchema.parse({ comment: "keep current blockers" });
+
+    expect(omitted).not.toHaveProperty("blockedByIssueIds");
+    expect(omitted).not.toHaveProperty("workMode");
+    expect(omitted).not.toHaveProperty("priority");
+    expect(omitted).not.toHaveProperty("requestDepth");
+    expect(updateIssueSchema.parse({ blockedByIssueIds: [] }).blockedByIssueIds).toEqual([]);
+  });
+
   it("accepts review policies on create and update while rejecting unknown values", () => {
     expect(createIssueSchema.parse({ title: "Human review", reviewPolicy: "human_only" }).reviewPolicy)
       .toBe("human_only");

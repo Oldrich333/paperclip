@@ -35,6 +35,7 @@ import {
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
+import { objectWithoutDefaults } from "./partial.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -536,11 +537,13 @@ export const createIssueLabelSchema = z.object({
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
-export const updateIssueSchema = createIssueBaseSchema.omit({
-  createdByUserId: true,
-  responsibleUserId: true,
-  watchdog: true,
-}).partial().extend({
+export const updateIssueSchema = objectWithoutDefaults(
+  createIssueBaseSchema.omit({
+    createdByUserId: true,
+    responsibleUserId: true,
+    watchdog: true,
+  }),
+).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),

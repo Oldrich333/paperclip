@@ -3759,6 +3759,63 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("does not block an in-progress issue after a concurrent execution-lock change", async () => {
+    const { companyId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    let reconcilePromise: ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues> | undefined;
+    await db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .for("update");
+      reconcilePromise = heartbeat.reconcileStrandedAssignedIssues();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tx
+        .update(issues)
+        .set({ executionLockedAt: new Date("2026-03-19T00:10:00.000Z") })
+        .where(eq(issues.id, issueId));
+    });
+
+    const result = await reconcilePromise;
+    expect(result?.successfulRunHandoffEscalated).toBe(0);
+    expect(result?.escalated).toBe(0);
+
+    const currentIssue = await db
+      .select({
+        status: issues.status,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(currentIssue?.status).toBe("in_progress");
+    expect(currentIssue?.executionLockedAt?.toISOString()).toBe("2026-03-19T00:10:00.000Z");
+  });
+
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

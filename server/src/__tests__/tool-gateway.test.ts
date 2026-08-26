@@ -1925,6 +1925,63 @@ rl.on("line", (line) => {
     }
   });
 
+  it("uses virtual search_tools and run_tool for baseline connected MCP tools", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: {
+          content: [{ type: "text", text: "baseline ok" }],
+          structuredContent: { receivedArguments: (fakeRequest.body?.params as Record<string, unknown>).arguments },
+        },
+      },
+    }));
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "baseline-memory",
+        toolName: "knowledge_read",
+        url: fake.url,
+      });
+      const targetToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [targetToolName]);
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const visibleTools = await gateway.listToolsForSession(session.token);
+      expect(visibleTools.map((tool) => tool.name)).toContain(targetToolName);
+
+      const search = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "search_tools",
+        parameters: { query: "knowledge", limit: 5 },
+      });
+      expect(JSON.stringify(search.result)).toContain(targetToolName);
+
+      const result = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: {
+          tool: targetToolName,
+          arguments: { uri: "viking://resources/company/orientation.md" },
+        },
+      });
+      expect(result).toMatchObject({
+        status: "completed",
+        tool: "run_tool",
+        targetTool: targetToolName,
+      });
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("decodes an SSE-framed tools/call response from a spec-compliant Streamable HTTP server", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -2709,6 +2766,13 @@ rl.on("line", (line) => {
           expect(failureAudit.details).toMatchObject({
             execution: { response: { httpStatus: 503 } },
           });
+        }
+        if (scenario.reasonCode === "tool_timeout") {
+          const [connectionRow] = await db
+            .select({ healthStatus: toolConnections.healthStatus })
+            .from(toolConnections)
+            .where(eq(toolConnections.companyId, company.id));
+          expect(connectionRow?.healthStatus).toBe("ok");
         }
       } finally {
         await fake.close();

@@ -9075,12 +9075,16 @@ export function issueRoutes(
       referencedIssueIdentifiers?: string[];
     } = issue;
     let updatedRelations: Awaited<ReturnType<typeof svc.getRelationSummaries>> | null = null;
-    if (issue && Array.isArray(req.body.blockedByIssueIds)) {
+    if (issue) {
       updatedRelations = await svc.getRelationSummaries(issue.id);
       issueResponse = {
         ...issue,
-        blockedByIssueIds:
-          issue.blockedByIssueIds ?? [...new Set(req.body.blockedByIssueIds as string[])].sort(),
+        ...(Array.isArray(req.body.blockedByIssueIds)
+          ? {
+              blockedByIssueIds:
+                issue.blockedByIssueIds ?? [...new Set(req.body.blockedByIssueIds as string[])].sort(),
+            }
+          : {}),
         blockedBy: updatedRelations.blockedBy,
         blocks: updatedRelations.blocks,
       };

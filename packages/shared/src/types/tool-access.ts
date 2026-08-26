@@ -985,6 +985,7 @@ export interface ToolInvocation {
   upstreamRequestId: string | null;
   resultHash: string | null;
   resultSummary: ToolRedactedValueSummary | null;
+  resultPayload: unknown | null;
   resultSizeBytes: number | null;
   resultArtifactId: string | null;
   errorCode: string | null;

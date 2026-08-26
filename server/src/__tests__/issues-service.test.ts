@@ -3745,6 +3745,11 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(blockersSet?.blockedByIssueIds).toEqual([blockerId]);
     expect(blockersSet?.changes.blockedByIssueIds).toEqual({ from: [], to: [blockerId] });
 
+    await svc.update(issueId, { title: "Receipt issue with blockers preserved" });
+    await expect(svc.getRelationSummaries(issueId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: blockerId })],
+    });
+
     const blockersCleared = await svc.update(issueId, { blockedByIssueIds: [] });
     expect(blockersCleared?.blockedByIssueIds).toEqual([]);
     expect(blockersCleared?.changes.blockedByIssueIds).toEqual({ from: [blockerId], to: [] });

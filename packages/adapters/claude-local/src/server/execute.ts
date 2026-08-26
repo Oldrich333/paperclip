@@ -117,6 +117,21 @@ interface ClaudeRuntimeConfig {
   extraArgs: string[];
 }
 
+function resolveExplicitLocalClaudeConfigDir(
+  config: Record<string, unknown>,
+): string | null {
+  const configEnv = parseObject(config.env);
+  const configuredDir =
+    typeof configEnv.CLAUDE_CONFIG_DIR === "string"
+      ? configEnv.CLAUDE_CONFIG_DIR.trim()
+      : "";
+  if (!configuredDir) return null;
+  return resolveSharedClaudeConfigDir({
+    ...process.env,
+    CLAUDE_CONFIG_DIR: configuredDir,
+  });
+}
+
 export function claudeSessionCwdMatchesExecutionTarget(input: {
   runtimeSessionCwd: string;
   effectiveExecutionCwd: string;
@@ -370,6 +385,10 @@ export async function runClaudeLogin(input: {
     context: input.context ?? {},
     authToken: input.authToken,
   });
+  const localClaudeConfigDir = resolveExplicitLocalClaudeConfigDir(input.config);
+  if (localClaudeConfigDir) {
+    runtime.env.CLAUDE_CONFIG_DIR = localClaudeConfigDir;
+  }
 
   const proc = await runAdapterExecutionTargetProcess(input.runId, null, runtime.command, ["login"], {
     cwd: runtime.cwd,
@@ -470,6 +489,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     extraArgs,
   } = runtimeConfig;
   let loggedEnv = initialLoggedEnv;
+  const explicitLocalClaudeConfigDir = executionTargetIsRemote
+    ? null
+    : resolveExplicitLocalClaudeConfigDir(config);
+  const localClaudeConfigDir =
+    explicitLocalClaudeConfigDir ?? resolveSharedClaudeConfigDir(process.env);
+  if (explicitLocalClaudeConfigDir) {
+    configEnv.CLAUDE_CONFIG_DIR = explicitLocalClaudeConfigDir;
+    env.CLAUDE_CONFIG_DIR = explicitLocalClaudeConfigDir;
+    loggedEnv.CLAUDE_CONFIG_DIR = explicitLocalClaudeConfigDir;
+  }
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   const terminalResultCleanupGraceMs = Math.max(
     0,
@@ -525,7 +554,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     servers: runtimeMcpServers,
   });
   const localMcpConfigDir = path.dirname(localMcpConfigPath);
-  const sharedClaudeConfigDir = resolveSharedClaudeConfigDir(process.env);
   const networkScope = parseLocalProcessNetworkScope(config.networkScope);
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
   const localProcessSandbox: LocalProcessSandboxOptions | null =
@@ -534,13 +562,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           workspaceDir: effectiveExecutionCwd,
           filesystemScope,
           managedPaths: [
-            { path: sharedClaudeConfigDir, access: "rw" },
-            { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
+            { path: localClaudeConfigDir, access: "rw" },
+            { path: path.join(path.dirname(localClaudeConfigDir), ".claude.json"), access: "rw" },
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
-          homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
+          homeDir: filesystemScope ? path.dirname(localClaudeConfigDir) : null,
           networkScope,
           networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
           networkTrustedUrls: [
@@ -551,7 +579,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       : null;
   if (localProcessSandbox) {
-    if (filesystemScope) env.CLAUDE_CONFIG_DIR = sharedClaudeConfigDir;
+    if (filesystemScope) env.CLAUDE_CONFIG_DIR = localClaudeConfigDir;
     const scopes = [filesystemScope ? "workspace filesystem" : null, networkScope ? `${networkScope} network` : null]
       .filter(Boolean)
       .join(" and ");
@@ -726,18 +754,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
   const runtimeMcpServerIdentity = asString(runtimeSessionParams.mcpServerIdentity, "");
+  const runtimeClaudeConfigDir = asString(runtimeSessionParams.claudeConfigDir, "");
+  const currentClaudeProfileIdentity = executionTargetIsRemote && hasExplicitClaudeConfigDir
+    ? String(configEnv.CLAUDE_CONFIG_DIR).trim()
+    : localClaudeConfigDir;
   const hasMatchingPromptBundle =
     runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
   const hasMatchingMcpServers =
     runtimeMcpServerIdentity.length === 0
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
+  const hasMatchingClaudeConfigDir =
+    (runtimeClaudeConfigDir.length > 0
+      ? executionTargetIsRemote
+        ? runtimeClaudeConfigDir === currentClaudeProfileIdentity
+        : path.resolve(runtimeClaudeConfigDir) === path.resolve(currentClaudeProfileIdentity)
+      : !hasExplicitClaudeConfigDir);
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
     hasMatchingMcpServers &&
+    hasMatchingClaudeConfigDir &&
     claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd,
       effectiveExecutionCwd,
@@ -770,6 +809,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
+    );
+  } else if (runtimeSessionId && isValidUuid && !hasMatchingClaudeConfigDir) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" belongs to a different Claude profile and will not be resumed.\n`,
     );
   } else if (runtimeSessionId && isValidUuid && !canResumeSession) {
     await onLog(
@@ -840,6 +884,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
       targetIsRemote: executionTargetIsRemote,
+      // The same server list that was written into `--mcp-config` above, so
+      // permission cannot drift from availability.
+      mcpServerNames: runtimeMcpServers.map((server) => server.name),
     }));
     if (chrome) args.push("--chrome");
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
@@ -1089,6 +1136,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         cwd,
         promptBundleKey: promptBundle.bundleKey,
         mcpServerIdentity: runtimeMcpIdentity,
+        ...(!executionTargetIsRemote || hasExplicitClaudeConfigDir
+          ? { claudeConfigDir: currentClaudeProfileIdentity }
+          : {}),
         ...(executionTargetIsRemote
           ? {
               remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
@@ -1231,7 +1281,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Claude resume session "${sessionId}" ${reason}; retrying with a fresh session.\n`,
       );
       if (sessionErrorKind === "poisoned" && !executionTargetIsRemote) {
-        const claudeConfigDir = resolveSharedClaudeConfigDir(effectiveEnv);
+        const claudeConfigDir = localClaudeConfigDir;
         // Mirrors Claude Code's project-dir encoding: non-alphanumeric chars become "-"; existing hyphens pass through.
         const encodedCwd = effectiveExecutionCwd.replace(/[^a-zA-Z0-9-]/g, "-");
         const poisonedJsonlPath = path.join(claudeConfigDir, "projects", encodedCwd, `${sessionId}.jsonl`);

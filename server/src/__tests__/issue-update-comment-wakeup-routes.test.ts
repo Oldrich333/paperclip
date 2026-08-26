@@ -454,6 +454,8 @@ describe("issue update comment wakeups", () => {
       });
 
     expect(res.status).toBe(200);
+    const updatePayload = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(updatePayload).not.toHaveProperty("blockedByIssueIds");
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       ASSIGNEE_AGENT_ID,
@@ -638,5 +640,43 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("echoes current blocker relations on PATCH updates that omit blockedByIssueIds", async () => {
+    const blockerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const updated = {
+      ...existing,
+      title: "Wake test renamed",
+    };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [{
+        id: blockerId,
+        identifier: "PAP-1000",
+        title: "Child blocker",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+      }],
+      blocks: [],
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        title: "Wake test renamed",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.blockedBy).toEqual([expect.objectContaining({ id: blockerId, identifier: "PAP-1000" })]);
+    const updatePayload = mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(updatePayload).not.toHaveProperty("blockedByIssueIds");
   });
 });
