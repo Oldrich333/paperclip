@@ -702,6 +702,8 @@ export interface ToolRuntimeMetricSnapshot {
   degradedConnections: number;
   remoteHttpConnections: number;
   localStdioConnections: number;
+  zeroToolCatalogEventsLastHour?: number;
+  advertisedToolMissingEventsLastHour?: number;
 }
 
 export interface ToolRuntimeSupportMatrix {
@@ -985,6 +987,7 @@ export interface ToolInvocation {
   upstreamRequestId: string | null;
   resultHash: string | null;
   resultSummary: ToolRedactedValueSummary | null;
+  resultPayload: unknown | null;
   resultSizeBytes: number | null;
   resultArtifactId: string | null;
   errorCode: string | null;

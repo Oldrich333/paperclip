@@ -48,6 +48,7 @@ import {
 import { DEFAULT_CURSOR_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { parseCursorJsonl, isCursorUnknownSessionError } from "./parse.js";
 import { prepareCursorSandboxCommand } from "./remote-command.js";
+import { writeCursorWorkspaceFoundationMcp } from "./workspace-foundation-mcp.js";
 import { normalizeCursorStreamLine } from "../shared/stream.js";
 import { hasCursorTrustBypassArg } from "../shared/trust.js";
 
@@ -304,6 +305,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
+  const foundationMcp = executionTargetIsRemote
+    ? null
+    : await writeCursorWorkspaceFoundationMcp({
+        env: { ...process.env, ...env },
+      });
+  if (foundationMcp) {
+    await onLog(
+      "stdout",
+      `[paperclip] Injected workspace foundation MCP "${foundationMcp.foundation.name}" into "${foundationMcp.configPath}".\n`,
+    );
+  }
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
     asNumber(config.timeoutSec, 0),
@@ -518,6 +530,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (autoTrustEnabled) {
       notes.push("Auto-added --yolo to bypass interactive prompts.");
     }
+    if (foundationMcp) {
+      notes.push(
+        `Injected workspace foundation MCP into ${foundationMcp.configPath} and auto-added --approve-mcps.`,
+      );
+    }
     notes.push("Prompt is piped to Cursor via stdin.");
     const sandboxCommand = finalSandboxCommand ?? initialSandboxCommand;
     if (sandboxCommand?.addedPathEntry) {
@@ -587,6 +604,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (model) args.push("--model", model);
     if (mode) args.push("--mode", mode);
     if (autoTrustEnabled) args.push("--yolo");
+    if (foundationMcp && !extraArgs.includes("--approve-mcps")) {
+      args.push("--approve-mcps");
+    }
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };

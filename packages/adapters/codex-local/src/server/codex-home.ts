@@ -265,6 +265,7 @@ function buildManagedMcpBlock(input: {
   gateways: ManagedCodexMcpGateway[];
   apiBaseUrl: string;
   existingNames: Set<string>;
+  foundation?: { name: string; command: string; args: string[] } | null;
 }): { block: string; warnings: string[] } {
   const warnings: string[] = [];
   const usedNames = new Set<string>();
@@ -295,6 +296,22 @@ function buildManagedMcpBlock(input: {
       `headers = { Authorization = ${tomlString(`Bearer ${gateway.bearerToken}`)} }`,
     );
   });
+  if (input.foundation) {
+    const foundationName = sanitizeMcpServerName(input.foundation.name, "hive-workspace-foundation");
+    let managedName = foundationName;
+    let suffix = 2;
+    while (usedNames.has(managedName) || input.existingNames.has(managedName)) {
+      managedName = `paperclip-${foundationName}-${suffix}`;
+      suffix += 1;
+    }
+    usedNames.add(managedName);
+    lines.push(
+      "",
+      `[mcp_servers.${tomlString(managedName)}]`,
+      `command = ${tomlString(input.foundation.command)}`,
+      `args = [${input.foundation.args.map((arg) => tomlString(arg)).join(", ")}]`,
+    );
+  }
   lines.push(MANAGED_MCP_BLOCK_END);
   return { block: lines.join("\n"), warnings };
 }
@@ -303,6 +320,7 @@ export async function writeManagedCodexMcpConfig(input: {
   codexHome: string;
   apiBaseUrl: string;
   gateways: ManagedCodexMcpGateway[];
+  foundation?: { name: string; command: string; args: string[] } | null;
 }): Promise<{ configPath: string; warnings: string[] }> {
   const configPath = path.join(input.codexHome, "config.toml");
   await fs.mkdir(input.codexHome, { recursive: true });
@@ -315,8 +333,10 @@ export async function writeManagedCodexMcpConfig(input: {
     gateways: input.gateways,
     apiBaseUrl: input.apiBaseUrl,
     existingNames: readCodexMcpServerNames(unmanagedConfig),
+    foundation: input.foundation ?? null,
   });
-  const next = input.gateways.length > 0
+  const hasManagedEntries = input.gateways.length > 0 || Boolean(input.foundation);
+  const next = hasManagedEntries
     ? `${unmanagedConfig}${unmanagedConfig ? "\n\n" : ""}${block}\n`
     : `${unmanagedConfig}${unmanagedConfig ? "\n" : ""}`;
   await fs.writeFile(configPath, next, { mode: 0o600 });

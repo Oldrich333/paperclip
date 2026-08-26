@@ -845,6 +845,7 @@ function toToolInvocation(row: typeof toolInvocations.$inferSelect): ToolInvocat
     upstreamRequestId: row.upstreamRequestId,
     resultHash: row.resultHash,
     resultSummary: row.resultSummary ?? null,
+    resultPayload: row.resultPayload ?? null,
     resultSizeBytes: row.resultSizeBytes,
     resultArtifactId: row.resultArtifactId,
     errorCode: row.errorCode,
@@ -1977,6 +1978,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     disabledConnections: number;
     missingSecretFailures: number;
     auditWriteFailures: number;
+    zeroToolCatalogEvents: number;
+    advertisedToolMissingEvents: number;
   }): ToolRuntimeAlertRecommendation[] {
     const runbookSection = "doc/MCP-RUNTIME-OPERATIONS.md";
     const timeoutSeverity =
@@ -2051,6 +2054,26 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         observed: `${input.restartAttempts} restart attempt(s), ${input.restartSuppressions} suppression(s).`,
         description: "Runtime slots are restarting repeatedly or have hit restart-storm suppression.",
         firstResponderAction: "Stop the affected slot, inspect stderr/audit reason codes, and keep the connection disabled until the template/upstream is fixed.",
+        runbookSection,
+      }),
+      runtimeAlert({
+        name: "mcp_runtime_zero_tool_catalog",
+        severity: "critical",
+        status: input.zeroToolCatalogEvents > 0 ? "firing" : "ok",
+        threshold: "Any active enabled connection with a stored catalog but zero mounted tools in a gateway session.",
+        observed: input.zeroToolCatalogEvents + " zero-tool catalog event(s).",
+        description: "An active MCP connection has stored tools but contributed none to a gateway session.",
+        firstResponderAction: "Inspect the connection, application transport, catalog status, and gateway discovery audit before changing grants.",
+        runbookSection,
+      }),
+      runtimeAlert({
+        name: "mcp_runtime_advertised_tool_missing",
+        severity: "critical",
+        status: input.advertisedToolMissingEvents > 0 ? "firing" : "ok",
+        threshold: "Any tool advertised by search_tools that later returns tool_not_found in the same gateway session.",
+        observed: input.advertisedToolMissingEvents + " advertised-then-missing event(s).",
+        description: "Gateway discovery advertised a tool that target resolution could not execute.",
+        firstResponderAction: "Inspect the connection catalog and gateway discovery audit; distinguish unmounted tools from deny_default policy decisions.",
         runbookSection,
       }),
       runtimeAlert({
@@ -2147,6 +2170,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       row.reasonCode === "missing_secret"
       || row.outcome === "failure" && row.reasonCode?.includes("secret")
     ).length;
+    const zeroToolCatalogEvents = auditRows.filter((row) => row.reasonCode === "gateway_catalog_zero").length;
+    const advertisedToolMissingEvents = auditRows.filter((row) => row.reasonCode === "advertised_tool_not_found").length;
     const legacyAuditWriteFailures = auditRows.filter((row) =>
       row.action === "runtime_audit_write_failed"
       || row.reasonCode === "audit_write_failed"
@@ -2192,6 +2217,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       degradedConnections,
       remoteHttpConnections: connections.filter((connection) => connection.status !== "archived" && connection.transport === "mcp_remote").length,
       localStdioConnections: connections.filter((connection) => connection.status !== "archived" && connection.transport === "local_stdio").length,
+      zeroToolCatalogEventsLastHour: zeroToolCatalogEvents,
+      advertisedToolMissingEventsLastHour: advertisedToolMissingEvents,
     };
     const recommendations = buildRuntimeAlerts({
       stuckStartingSlots: metrics.stuckStartingSlots,
@@ -2207,6 +2234,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       disabledConnections,
       missingSecretFailures,
       auditWriteFailures: metrics.auditWriteFailuresLastHour,
+      zeroToolCatalogEvents,
+      advertisedToolMissingEvents,
     });
     const firing = recommendations.filter((alert) => alert.status === "firing");
     const status = firing.some((alert) => alert.severity === "critical")
@@ -2982,8 +3011,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         connectionId: connection.id,
         action: "tool_connection.health_check",
         outcome: "success",
+        reasonCode: isAttentionHealthStatus(connection.healthStatus) ? "connection_health_recovered" : "health_check_succeeded",
         actor,
-        details: { transport: connection.transport },
+        details: {
+          transport: connection.transport,
+          healthEdge: isAttentionHealthStatus(connection.healthStatus) ? "up" : "probe",
+          previousHealthStatus: connection.healthStatus,
+        },
       });
       return { connection: toConnection(updated), runtimeSlot };
     } catch (error) {
@@ -3136,12 +3170,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         .where(eq(toolRuntimeSlots.connectionId, connection.id));
     }
 
+    const healthRecovered = isAttentionHealthStatus(connection.healthStatus);
     await audit({
       companyId: connection.companyId,
       connectionId: connection.id,
       action: "tool_connection.catalog_refresh",
       outcome: "success",
-      details: { discoveredCount: descriptors.length, quarantinedCount },
+      reasonCode: healthRecovered ? "connection_health_recovered" : "catalog_refresh_succeeded",
+      details: {
+        discoveredCount: descriptors.length,
+        quarantinedCount,
+        healthEdge: healthRecovered ? "up" : "probe",
+        previousHealthStatus: connection.healthStatus,
+      },
       actor,
     });
 

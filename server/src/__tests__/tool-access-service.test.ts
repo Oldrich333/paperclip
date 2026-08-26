@@ -6589,6 +6589,95 @@ describeEmbeddedPostgres("tool access service", () => {
       .toMatchObject({ status: "ok", observed: "0 audit write failure(s) in 1 hour." });
   });
 
+
+  it("alerts on zero-catalog and advertised-then-missing audit signals", async () => {
+    const company = await createCompany(db);
+    const generatedAt = new Date("2026-06-06T00:00:00.000Z");
+    const service = toolAccessService(db, { now: () => generatedAt });
+    await db.insert(toolAccessAuditEvents).values([
+      {
+        companyId: company.id,
+        action: "call_failed",
+        outcome: "failure",
+        reasonCode: "gateway_catalog_zero",
+        details: { connectionId: randomUUID(), storedCatalogToolCount: 2, mountedToolCount: 0 },
+        createdAt: generatedAt,
+      },
+      {
+        companyId: company.id,
+        action: "call_failed",
+        outcome: "failure",
+        reasonCode: "advertised_tool_not_found",
+        details: { tool: "run_tool", targetToolName: "mcp.example:kv_get" },
+        createdAt: generatedAt,
+      },
+    ]);
+
+    const health = await service.getRuntimeHealth(company.id);
+
+    expect(health.metrics).toMatchObject({
+      zeroToolCatalogEventsLastHour: 1,
+      advertisedToolMissingEventsLastHour: 1,
+    });
+    expect(health.alerts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "mcp_runtime_zero_tool_catalog", severity: "critical", status: "firing" }),
+      expect.objectContaining({ name: "mcp_runtime_advertised_tool_missing", severity: "critical", status: "firing" }),
+    ]));
+  });
+
+  it("audits the up edge when the health sweep restores a connection", async () => {
+    const company = await createCompany(db);
+    const generatedAt = new Date("2026-06-06T00:00:00.000Z");
+    const service = toolAccessService(db, { now: () => generatedAt });
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      name: "Recovery app",
+      type: "mcp_http",
+      status: "active",
+    }).returning();
+    const staleAt = new Date(generatedAt.getTime() - 60 * 60 * 1000);
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: "Recovering remote",
+      uid: "test/" + randomUUID(),
+      transport: "mcp_remote",
+      status: "active",
+      enabled: true,
+      healthStatus: "error",
+      healthMessage: "Remote MCP server returned an HTTP error.",
+      healthCheckedAt: staleAt,
+      config: { url: "https://recovery.example/mcp" },
+      transportConfig: { url: "https://recovery.example/mcp" },
+    }).returning();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(mcpHttpResponse({
+      jsonrpc: "2.0",
+      id: "health",
+      result: { tools: [] },
+    }));
+
+    const sweep = await service.sweepConnectionHealth({ staleAfterMs: 0, limit: 25 });
+    expect(sweep).toMatchObject({ checked: 1, healthy: 1, failed: 0 });
+    const [recoveryAudit] = await db
+      .select()
+      .from(toolAccessAuditEvents)
+      .where(and(
+        eq(toolAccessAuditEvents.connectionId, connection.id),
+        eq(toolAccessAuditEvents.action, "tool_connection.health_check"),
+        eq(toolAccessAuditEvents.reasonCode, "connection_health_recovered"),
+      ));
+
+    expect(recoveryAudit).toMatchObject({
+      outcome: "success",
+      details: {
+        transport: "mcp_remote",
+        healthEdge: "up",
+        previousHealthStatus: "error",
+      },
+    });
+  });
+
+
   it("fires runtime health from the durable audit-write failure counter", async () => {
     const company = await createCompany(db);
     const generatedAt = new Date("2026-06-06T00:00:00.000Z");

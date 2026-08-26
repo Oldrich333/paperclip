@@ -750,6 +750,32 @@ describe("evaluateCodexCredentialReadiness", () => {
     }
   });
 
+  it("injects hive-workspace-foundation as a managed stdio MCP server", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-foundation-"));
+    try {
+      const home = path.join(root, "agent");
+      const script = path.join(root, "hive_workspace_foundation_mcp.py");
+      await fs.writeFile(script, "print('ok')\n");
+      await writeManagedCodexMcpConfig({
+        codexHome: home,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [],
+        foundation: {
+          name: "hive-workspace-foundation",
+          command: "python3",
+          args: [script],
+        },
+      });
+      const config = await fs.readFile(path.join(home, "config.toml"), "utf8");
+      expect(config).toContain('[mcp_servers."hive-workspace-foundation"]');
+      expect(config).toContain('command = "python3"');
+      expect(config).toContain(`args = [${JSON.stringify(script)}]`);
+      expect(config).not.toContain("url =");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("restricts permissions on an existing managed MCP config", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-config-"));
     try {

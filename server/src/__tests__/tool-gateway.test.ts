@@ -1346,7 +1346,7 @@ rl.on("line", (line) => {
     }
   });
 
-  it("keeps connected remote MCP gateway names collision-safe and excludes inactive catalog sources", async () => {
+  it("keeps connected remote MCP gateway names collision-safe and mounts degraded catalog sources", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -1368,7 +1368,7 @@ rl.on("line", (line) => {
       toolName: "kv_set",
       connectionEnabled: false,
     });
-    await createRemoteMcpTool(db, company.id, {
+    const unhealthy = await createRemoteMcpTool(db, company.id, {
       applicationKey: "unhealthy-demo",
       connectionName: "Unhealthy Demo",
       toolName: "kv_set",
@@ -1387,12 +1387,13 @@ rl.on("line", (line) => {
 
     const connectedTools = (await gateway.listToolsForSession(session.token))
       .filter((tool) => tool.providerType === "mcp_remote_http");
-    expect(connectedTools).toHaveLength(2);
+    expect(connectedTools).toHaveLength(3);
     expect(connectedTools.map((tool) => tool.catalogEntryId).sort()).toEqual([
       first.catalogEntry.id,
       second.catalogEntry.id,
+      unhealthy.catalogEntry.id,
     ].sort());
-    expect(new Set(connectedTools.map((tool) => tool.name)).size).toBe(2);
+    expect(new Set(connectedTools.map((tool) => tool.name)).size).toBe(3);
     expect(connectedTools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
       expect.stringMatching(new RegExp(`^mcp\\.kv-demo-${first.connection.id.replace(/-/g, "").slice(0, 8)}:kv-set$`)),
       expect.stringMatching(new RegExp(`^mcp\\.kv-demo-${second.connection.id.replace(/-/g, "").slice(0, 8)}:kv-set$`)),
@@ -1924,6 +1925,97 @@ rl.on("line", (line) => {
       await fake.close();
     }
   });
+
+
+  it("records advertised-then-missing when run_tool loses a searched target", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(() => ({
+      body: {
+        jsonrpc: "2.0",
+        id: "test",
+        result: { content: [{ type: "text", text: "ok" }] },
+      },
+    }));
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "advertised-missing",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      await db.update(toolConnections)
+        .set({ config: { url: fake.url, onDemandTools: { enabled: true } } })
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await db.insert(toolCatalogEntries).values({
+        companyId: company.id,
+        applicationId: remoteTool.application.id,
+        connectionId: remoteTool.connection.id,
+        entryKind: "tool",
+        name: "kv_get-" + randomUUID(),
+        toolName: "kv_get",
+        title: "KV Get",
+        description: "Call kv_get",
+        inputSchema: { type: "object" },
+        annotations: {},
+        riskLevel: "read",
+        isReadOnly: true,
+        isWrite: false,
+        isDestructive: false,
+        status: "active",
+        versionHash: randomUUID(),
+        schemaHash: randomUUID(),
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const targetToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const search = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: "search_tools",
+        parameters: { query: "kv", limit: 10 },
+      });
+      expect(JSON.stringify(search.result)).toContain(targetToolName);
+
+      await db.update(toolCatalogEntries)
+        .set({ status: "removed" })
+        .where(eq(toolCatalogEntries.id, remoteTool.catalogEntry.id));
+
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: "run_tool",
+        parameters: { tool: targetToolName, arguments: { key: "lost", value: "target" } },
+      })).rejects.toMatchObject({ reasonCode: "tool_not_found" });
+
+      const [missingAudit] = await db
+        .select()
+        .from(toolAccessAuditEvents)
+        .where(and(
+          eq(toolAccessAuditEvents.reasonCode, "advertised_tool_not_found"),
+          eq(toolAccessAuditEvents.connectionId, remoteTool.connection.id),
+        ));
+      expect(missingAudit).toMatchObject({
+        action: "call_failed",
+        outcome: "failure",
+        details: {
+          targetToolName,
+          sourceErrorReasonCode: "tool_not_found",
+        },
+      });
+      const denyAudits = await db
+        .select()
+        .from(toolAccessAuditEvents)
+        .where(eq(toolAccessAuditEvents.reasonCode, "deny_default"));
+      expect(denyAudits).toHaveLength(0);
+    } finally {
+      await fake.close();
+    }
+  });
+
 
   it("decodes an SSE-framed tools/call response from a spec-compliant Streamable HTTP server", async () => {
     const company = await createCompany(db);
@@ -2614,6 +2706,205 @@ rl.on("line", (line) => {
       await fake.close();
     }
   });
+
+
+  it("keeps sibling remote tools mounted after one timeout and leaves the health sweep due", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(async (request) => {
+      const method = typeof request.body?.method === "string" ? request.body.method : "";
+      if (method === "tools/list") {
+        return {
+          body: {
+            jsonrpc: "2.0",
+            id: request.body?.id ?? "list",
+            result: { tools: [] },
+          },
+        };
+      }
+      const params = request.body?.params as Record<string, unknown> | undefined;
+      const toolName = typeof params?.name === "string" ? params.name : "";
+      if (toolName === "kv_set") {
+        return {
+          delayMs: 75,
+          body: {
+            jsonrpc: "2.0",
+            id: request.body?.id ?? "slow",
+            result: { content: [{ type: "text", text: "late" }] },
+          },
+        };
+      }
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: request.body?.id ?? "fast",
+          result: { content: [{ type: "text", text: "fast" }] },
+        },
+      };
+    });
+    try {
+      const remote = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "timeout-sibling-tools",
+        toolName: "kv_set",
+        url: fake.url,
+        riskLevel: "write",
+      });
+      await db.insert(toolCatalogEntries).values({
+        companyId: company.id,
+        applicationId: remote.application.id,
+        connectionId: remote.connection.id,
+        entryKind: "tool",
+        name: "kv_get-" + randomUUID(),
+        toolName: "kv_get",
+        title: "KV Get",
+        description: "Call kv_get",
+        inputSchema: { type: "object" },
+        annotations: {},
+        riskLevel: "read",
+        isReadOnly: true,
+        isWrite: false,
+        isDestructive: false,
+        status: "active",
+        versionHash: randomUUID(),
+        schemaHash: randomUUID(),
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const staleAt = new Date(Date.now() - 60 * 60 * 1000);
+      await db
+        .update(toolConnections)
+        .set({ healthStatus: "ok", healthCheckedAt: staleAt })
+        .where(eq(toolConnections.id, remote.connection.id));
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const before = await gateway.listToolsForSession(session.token);
+      expect(before.filter((tool) => tool.connectionId === remote.connection.id).map((tool) => tool.upstreamToolName))
+        .toEqual(expect.arrayContaining(["kv_set", "kv_get"]));
+      const slowTool = before.find((tool) => tool.connectionId === remote.connection.id && tool.upstreamToolName === "kv_set");
+      expect(slowTool).toBeTruthy();
+
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: slowTool!.name,
+        parameters: { key: "alpha", value: "one" },
+        timeoutMs: 10,
+      })).rejects.toMatchObject({ reasonCode: "tool_timeout" });
+
+      const [afterTimeout] = await db.select().from(toolConnections).where(eq(toolConnections.id, remote.connection.id));
+      expect(afterTimeout).toMatchObject({ healthStatus: "ok" });
+      expect(afterTimeout.healthCheckedAt?.getTime()).toBe(staleAt.getTime());
+
+      const after = await gateway.listToolsForSession(session.token);
+      expect(after.filter((tool) => tool.connectionId === remote.connection.id).map((tool) => tool.upstreamToolName))
+        .toEqual(expect.arrayContaining(["kv_set", "kv_get"]));
+
+      const sweep = await toolAccessService(db).sweepConnectionHealth({ staleAfterMs: 0, limit: 25 });
+      expect(sweep).toMatchObject({ checked: 1, healthy: 1, failed: 0 });
+      expect(fake.requests.some((request) => request.body?.method === "tools/list")).toBe(true);
+      const [afterSweep] = await db.select().from(toolConnections).where(eq(toolConnections.id, remote.connection.id));
+      expect(afterSweep.healthStatus).toBe("ok");
+      expect(afterSweep.healthCheckedAt?.getTime()).toBeGreaterThan(staleAt.getTime());
+    } finally {
+      await fake.close();
+    }
+  });
+
+
+
+  it("audits an active connection whose stored catalog contributes zero mounted tools", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remote = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "zero-catalog",
+      toolName: "kv_set",
+    });
+    await db.update(toolApplications)
+      .set({ type: "mcp_stdio" })
+      .where(eq(toolApplications.id, remote.application.id));
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+    await gateway.listToolsForSession(session.token);
+
+    const [zeroAudit] = await db
+      .select()
+      .from(toolAccessAuditEvents)
+      .where(and(
+        eq(toolAccessAuditEvents.connectionId, remote.connection.id),
+        eq(toolAccessAuditEvents.reasonCode, "gateway_catalog_zero"),
+      ));
+    expect(zeroAudit).toMatchObject({
+      action: "call_failed",
+      outcome: "failure",
+      details: {
+        storedCatalogToolCount: 1,
+        mountedToolCount: 0,
+      },
+    });
+  });
+
+
+
+  it("requires three connection-level failures before the audited down edge", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(() => ({
+      status: 503,
+      body: { error: "unavailable" },
+    }));
+    try {
+      const remote = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "connection-failure-threshold",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const staleAt = new Date(Date.now() - 60 * 60 * 1000);
+      await db
+        .update(toolConnections)
+        .set({ healthStatus: "ok", healthCheckedAt: staleAt })
+        .where(eq(toolConnections.id, remote.connection.id));
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token))
+        .find((candidate) => candidate.connectionId === remote.connection.id);
+      expect(tool).toBeTruthy();
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await expect(gateway.executeTool({
+          sessionToken: session.token,
+          tool: tool!.name,
+          parameters: { key: "failure-" + attempt, value: "one" },
+        })).rejects.toMatchObject({ reasonCode: "mcp_remote_status" });
+        const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, remote.connection.id));
+        expect(connection.healthStatus).toBe(attempt === 2 ? "error" : "ok");
+        expect(connection.healthCheckedAt?.getTime()).toBe(staleAt.getTime());
+      }
+
+      const [downAudit] = await db
+        .select()
+        .from(toolAccessAuditEvents)
+        .where(and(
+          eq(toolAccessAuditEvents.connectionId, remote.connection.id),
+          eq(toolAccessAuditEvents.reasonCode, "connection_health_degraded"),
+        ));
+      expect(downAudit).toMatchObject({
+        action: "call_failed",
+        outcome: "failure",
+        details: {
+          healthEdge: "down",
+          consecutiveFailures: 3,
+          failureReasonCode: "mcp_remote_status",
+        },
+      });
+    } finally {
+      await fake.close();
+    }
+  });
+
 
   const remoteFailureCases = [
     {

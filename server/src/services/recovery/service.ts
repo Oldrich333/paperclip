@@ -3297,6 +3297,80 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  function sameRecoverySnapshotDate(left: Date | null, right: Date | null) {
+    return left?.getTime() === right?.getTime();
+  }
+
+  function sameStrandedIssueSnapshot(
+    current: typeof issues.$inferSelect,
+    candidate: typeof issues.$inferSelect,
+  ) {
+    return current.status === candidate.status &&
+      current.assigneeAgentId === candidate.assigneeAgentId &&
+      current.assigneeUserId === candidate.assigneeUserId &&
+      current.checkoutRunId === candidate.checkoutRunId &&
+      current.executionRunId === candidate.executionRunId &&
+      current.executionAgentNameKey === candidate.executionAgentNameKey &&
+      sameRecoverySnapshotDate(current.executionLockedAt, candidate.executionLockedAt);
+  }
+
+  async function updateStrandedIssueIfStillCurrent(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    patch: Parameters<typeof issuesSvc.update>[1];
+  }) {
+    return db.transaction(async (tx) => {
+      const [currentIssue] = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .for("update");
+      if (!currentIssue || !sameStrandedIssueSnapshot(currentIssue, input.issue)) return null;
+
+      const [currentLatestRun] = await tx
+        .select({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          error: heartbeatRuns.error,
+          errorCode: heartbeatRuns.errorCode,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          livenessState: heartbeatRuns.livenessState,
+          resultJson: heartbeatRuns.resultJson,
+          startedAt: heartbeatRuns.startedAt,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, input.issue.companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+        ))
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+        .limit(1);
+      if (currentLatestRun?.id !== input.latestRun?.id || currentLatestRun?.status !== input.latestRun?.status) {
+        return null;
+      }
+
+      if (input.successfulRunHandoffEvidence) {
+        const currentEvidence = successfulRunHandoffRecoveryEvidence(currentLatestRun ?? null);
+        const expectedEvidence = input.successfulRunHandoffEvidence;
+        if (
+          !currentEvidence ||
+          currentEvidence.correctiveRunId !== expectedEvidence.correctiveRunId ||
+          currentEvidence.sourceRunId !== expectedEvidence.sourceRunId ||
+          currentEvidence.missingDisposition !== expectedEvidence.missingDisposition ||
+          currentEvidence.handoffAttempt !== expectedEvidence.handoffAttempt ||
+          currentEvidence.maxHandoffAttempts !== expectedEvidence.maxHandoffAttempts
+        ) {
+          return null;
+        }
+      }
+
+      return issuesSvc.update(input.issue.id, input.patch, tx);
+    });
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3336,10 +3410,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+    const updated = await updateStrandedIssueIfStillCurrent({
+      issue: input.issue,
+      latestRun: input.latestRun,
+      successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      patch: {
+        status: "blocked",
+        blockedByIssueIds: blockerIds,
+        assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      },
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;

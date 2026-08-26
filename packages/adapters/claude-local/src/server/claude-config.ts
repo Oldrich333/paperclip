@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext, AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import { resolveWorkspaceFoundationMcpStdio } from "@paperclipai/adapter-utils/workspace-foundation-mcp";
 import {
   runAdapterExecutionTargetShellCommand,
   type AdapterExecutionTarget,
@@ -150,6 +151,7 @@ export async function writePaperclipClaudeMcpConfig(input: {
   stateDir: string;
   runId: string;
   servers: AdapterRuntimeMcpServer[];
+  env?: NodeJS.ProcessEnv;
 }): Promise<string> {
   const configDir = path.join(input.stateDir, "runs", input.runId, "mcp");
   const configPath = path.join(configDir, "mcp-config.json");
@@ -168,6 +170,14 @@ export async function writePaperclipClaudeMcpConfig(input: {
       type: "http",
       url: server.url,
       headers: { Authorization: `Bearer ${server.token}` },
+    };
+  }
+  const foundation = resolveWorkspaceFoundationMcpStdio(input.env ?? process.env);
+  if (foundation && !usedNames.has(foundation.name)) {
+    usedNames.add(foundation.name);
+    mcpServers[foundation.name] = {
+      command: foundation.command,
+      args: foundation.args,
     };
   }
   await fs.mkdir(configDir, { recursive: true });

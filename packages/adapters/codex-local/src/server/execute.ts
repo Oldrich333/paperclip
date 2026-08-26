@@ -28,6 +28,7 @@ import {
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
+import { resolveWorkspaceFoundationMcpStdio } from "@paperclipai/adapter-utils/workspace-foundation-mcp";
 import {
   asString,
   asNumber,
@@ -712,15 +713,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       runtimeMcpGateways,
       managedMcpGatewaysFromContext(context),
     );
+    const foundationMcp = resolveWorkspaceFoundationMcpStdio({
+      ...process.env,
+      ...envConfigStrings,
+    });
     const managedMcp = await writeManagedCodexMcpConfig({
       codexHome: effectiveCodexHome,
       apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
       gateways: managedMcpGateways,
+      foundation: foundationMcp,
     });
     if (managedMcpGateways.length > 0) {
       await onLog(
         "stdout",
         `[paperclip] Wrote ${managedMcpGateways.length} managed MCP gateway(s) into Codex config "${managedMcp.configPath}".\n`,
+      );
+    }
+    if (foundationMcp) {
+      await onLog(
+        "stdout",
+        `[paperclip] Injected workspace foundation MCP "${foundationMcp.name}" (stdio) into Codex config "${managedMcp.configPath}".\n`,
       );
     }
     for (const warning of managedMcp.warnings) {

@@ -77,7 +77,9 @@ import {
 
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
-const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
+const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+const REMOTE_CONNECTION_FAILURE_THRESHOLD = 3;
+const REMOTE_CONNECTION_FAILURE_REASON_CODES = new Set(["mcp_remote_status", "mcp_remote_fetch_failed"]);
 // When a human approves a parked write, the server carries it out on their
 // behalf with no interactive caller left to raise `timeoutMs`. Remote write
 // providers (e.g. Zapier Google Sheets `add_row`) routinely take longer than
@@ -86,6 +88,7 @@ const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
+const MAX_STORED_TOOL_RESULT_BYTES = MAX_REMOTE_MCP_RESPONSE_BYTES;
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -458,6 +461,17 @@ function summarizeResult(result: unknown): Record<string, unknown> {
     hasData: record.data !== undefined,
     hasError: Boolean(record.error),
   };
+}
+
+function completeStoredToolResult(validation: ReturnType<typeof validateToolContent>): unknown {
+  if ((validation.summary.sizeBytes ?? 0) > MAX_STORED_TOOL_RESULT_BYTES) {
+    throw new ToolContentValidationError(
+      `Tool result exceeds the ${MAX_STORED_TOOL_RESULT_BYTES}-byte durable result limit`,
+      "tool_result_too_large",
+      ["result_too_large"],
+    );
+  }
+  return validation.value;
 }
 
 function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
@@ -862,7 +876,6 @@ export function createToolGatewayService(
         inArray(toolConnections.transport, ["mcp_remote", "local_stdio"]),
         eq(toolConnections.status, "active"),
         eq(toolConnections.enabled, true),
-        inArray(toolConnections.healthStatus, ["ok", "healthy"]),
         eq(toolApplications.companyId, companyId),
         inArray(toolApplications.type, ["mcp_http", "mcp_stdio"]),
         eq(toolApplications.status, "active"),
@@ -1832,13 +1845,46 @@ export function createToolGatewayService(
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
-    const tool = [...allTools(), ...connectedTools, ...virtualTools]
-      .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
-      .find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found`, "tool_not_found", { tool: toolName });
-    }
-    return tool;
+    const candidates = [...allTools(), ...connectedTools, ...virtualTools]
+      .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"));
+    const exact = candidates.find((candidate) => candidate.name === toolName);
+    if (exact) return exact;
+
+    const upstreamMatches = candidates.filter((candidate) => {
+      const metadata = asRecord(candidate.providerMetadata);
+      return candidate.upstreamToolName === toolName || metadata?.catalogName === toolName;
+    });
+    if (upstreamMatches.length === 1) return upstreamMatches[0]!;
+
+    const tokenize = (value: string) => value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const fieldsFor = (candidate: ToolGatewayDescriptor) => [
+      candidate.name,
+      candidate.upstreamToolName,
+      candidate.displayName,
+      candidate.description,
+      candidate.applicationKey,
+      asRecord(candidate.providerMetadata)?.catalogName,
+    ].filter((value): value is string => typeof value === "string");
+    const requestedTokens = tokenize(toolName);
+    const suggestions = requestedTokens.length === 0 ? [] : candidates
+      .filter(isOnDemandRemoteTool)
+      .map((candidate) => {
+        const candidateTokens = new Set(fieldsFor(candidate).flatMap(tokenize));
+        const score = requestedTokens.reduce(
+          (total, token) => total + ([...candidateTokens].some((candidateToken) => candidateToken.includes(token)) ? 1 : 0),
+          0,
+        );
+        return { candidate, score };
+      })
+      .filter(({ score }) => score > 0)
+      .sort((left, right) => right.score - left.score || left.candidate.name.localeCompare(right.candidate.name))
+      .slice(0, 5)
+      .map(({ candidate }) => candidate.name);
+    const suggestionText = suggestions.length > 0 ? `; nearest candidates: ${suggestions.join(", ")}` : "";
+    throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found${suggestionText}`, "tool_not_found", {
+      tool: toolName,
+      suggestions,
+    });
   }
 
   function virtualRunToolInput(parameters: unknown): { targetToolName: string; targetParameters: unknown } {
@@ -1867,18 +1913,20 @@ export function createToolGatewayService(
   async function executeVirtualSearchTools(session: ToolGatewaySession, parameters: unknown) {
     const params = asRecord(parameters) ?? {};
     const query = typeof params.query === "string" ? params.query.trim().toLowerCase() : "";
+    const queryTokens = query.split(/[^a-z0-9]+/).filter(Boolean);
     const limit = Math.max(1, Math.min(50, Number(params.limit ?? 10) || 10));
     const tools = (await searchableOnDemandTools(session))
       .filter((tool) => {
-        if (!query) return true;
-        return [
+        if (queryTokens.length === 0) return true;
+        const candidateTokens = new Set([
           tool.name,
           tool.displayName,
           tool.description,
           tool.applicationKey,
           tool.upstreamToolName,
-        ].filter((value): value is string => typeof value === "string")
-          .some((value) => value.toLowerCase().includes(query));
+          asRecord(tool.providerMetadata)?.catalogName,
+        ].filter((value): value is string => typeof value === "string").flatMap((value) => value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)));
+        return queryTokens.every((queryToken) => [...candidateTokens].some((candidateToken) => candidateToken.includes(queryToken)));
       })
       .slice(0, limit)
       .map((tool) => ({
@@ -1899,11 +1947,75 @@ export function createToolGatewayService(
     };
   }
 
+  async function auditZeroToolCatalogConnections(session: ToolGatewaySession, mountedTools: ToolGatewayDescriptor[]) {
+    const storedRows = await db
+      .select({
+        connectionId: toolConnections.id,
+        connectionName: toolConnections.name,
+        healthStatus: toolConnections.healthStatus,
+      })
+      .from(toolCatalogEntries)
+      .innerJoin(toolConnections, eq(toolCatalogEntries.connectionId, toolConnections.id))
+      .where(and(
+        eq(toolCatalogEntries.companyId, session.companyId),
+        eq(toolCatalogEntries.entryKind, "tool"),
+        eq(toolConnections.companyId, session.companyId),
+        eq(toolConnections.status, "active"),
+        eq(toolConnections.enabled, true),
+      ));
+    const storedByConnection = new Map<string, { count: number; name: string; healthStatus: string }>();
+    for (const row of storedRows) {
+      const previous = storedByConnection.get(row.connectionId);
+      storedByConnection.set(row.connectionId, {
+        count: (previous?.count ?? 0) + 1,
+        name: row.connectionName,
+        healthStatus: row.healthStatus,
+      });
+    }
+    const mountedByConnection = new Map<string, number>();
+    for (const tool of mountedTools) {
+      if (!tool.connectionId) continue;
+      mountedByConnection.set(tool.connectionId, (mountedByConnection.get(tool.connectionId) ?? 0) + 1);
+    }
+    for (const [connectionId, stored] of storedByConnection) {
+      if ((mountedByConnection.get(connectionId) ?? 0) > 0) continue;
+      const priorEvents = await db
+        .select({ details: toolAccessAuditEvents.details })
+        .from(toolAccessAuditEvents)
+        .where(and(
+          eq(toolAccessAuditEvents.companyId, session.companyId),
+          eq(toolAccessAuditEvents.connectionId, connectionId),
+          eq(toolAccessAuditEvents.action, "call_failed"),
+          eq(toolAccessAuditEvents.reasonCode, "gateway_catalog_zero"),
+        ))
+        .limit(25);
+      if (priorEvents.some(({ details }) => asRecord(details)?.gatewaySessionId === session.id)) continue;
+      await writeAudit({
+        session,
+        companyId: session.companyId,
+        agentId: session.agentId,
+        runId: session.runId,
+        issueId: session.issueId,
+        action: "tool_gateway.call_failed",
+        details: {
+          connectionId,
+          reasonCode: "gateway_catalog_zero",
+          source: "gateway_discovery",
+          connectionName: stored.name,
+          healthStatus: stored.healthStatus,
+          storedCatalogToolCount: stored.count,
+          mountedToolCount: 0,
+        },
+      });
+    }
+  }
+
   async function listToolsForContext(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
     const allConnectedTools = await connectedMcpToolsForCompany(session.companyId);
+    await auditZeroToolCatalogConnections(session, allConnectedTools);
     const onDemandTargets = allConnectedTools.filter(isOnDemandRemoteTool);
     const tools = [...allTools(), ...allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool))].filter(
       (tool) => session.agentId || (tool.providerType !== "paperclip_self" && tool.providerType !== "paperclip_plugin"),
@@ -2333,12 +2445,58 @@ export function createToolGatewayService(
       .set({
         healthStatus: status,
         healthMessage: message,
-        healthCheckedAt: now,
         lastHealthAt: now,
         lastError: status === "ok" ? null : message,
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id));
+  }
+
+  async function recordRemoteConnectionFailure(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+    message: string,
+    reasonCode: string,
+  ) {
+    const recentEvents = await db
+      .select({ action: toolAccessAuditEvents.action, reasonCode: toolAccessAuditEvents.reasonCode })
+      .from(toolAccessAuditEvents)
+      .where(and(
+        eq(toolAccessAuditEvents.companyId, connection.companyId),
+        eq(toolAccessAuditEvents.connectionId, connection.id),
+        inArray(toolAccessAuditEvents.action, ["call_failed", "call_completed"]),
+      ))
+      .orderBy(desc(toolAccessAuditEvents.createdAt))
+      .limit(REMOTE_CONNECTION_FAILURE_THRESHOLD * 4);
+    let consecutiveFailures = 1;
+    for (const event of recentEvents) {
+      if (event.action === "call_completed") break;
+      if (event.reasonCode && REMOTE_CONNECTION_FAILURE_REASON_CODES.has(event.reasonCode)) {
+        consecutiveFailures += 1;
+      }
+    }
+    if (consecutiveFailures < REMOTE_CONNECTION_FAILURE_THRESHOLD) return;
+
+    const wasHealthy = connection.healthStatus === "ok" || connection.healthStatus === "healthy";
+    await markRemoteConnectionHealth(connection, "error", message);
+    if (wasHealthy) {
+      await writeAudit({
+        session,
+        companyId: connection.companyId,
+        agentId: session.agentId,
+        runId: session.runId,
+        issueId: session.issueId,
+        action: "tool_gateway.call_failed",
+        details: {
+          connectionId: connection.id,
+          reasonCode: "connection_health_degraded",
+          healthEdge: "down",
+          failureReasonCode: reasonCode,
+          consecutiveFailures,
+          healthStatus: "error",
+        },
+      });
+    }
   }
 
   async function resolveCredentialHeaders(connection: typeof toolConnections.$inferSelect): Promise<Record<string, string>> {
@@ -3063,7 +3221,7 @@ export function createToolGatewayService(
           ?? response.headers.get("traceparent"),
       };
       if (!response.ok) {
-        await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned an HTTP error.");
+        await recordRemoteConnectionFailure(session, connection, "Remote MCP server returned an HTTP error.", "mcp_remote_status");
         throw new ToolGatewayHttpError(502, "Remote MCP server returned an HTTP error", "mcp_remote_status", {
           status: response.status,
           connectionId: connection.id,
@@ -3075,7 +3233,6 @@ export function createToolGatewayService(
       try {
         payload = parseMcpHttpResponseBody(body, response.headers.get("content-type"));
       } catch {
-        await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned invalid JSON.");
         throw new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json", {
           connectionId: connection.id,
           catalogEntryId: entry.id,
@@ -3090,7 +3247,6 @@ export function createToolGatewayService(
       }
       if (payloadRecord.error !== undefined) {
         const errorRecord = asRecord(payloadRecord.error);
-        await markRemoteConnectionHealth(connection, "error", "Remote MCP server returned a JSON-RPC error.");
         throw new ToolGatewayHttpError(502, "Remote MCP server returned an error", "remote_mcp_error", {
           code: typeof errorRecord?.code === "number" ? errorRecord.code : null,
           connectionId: connection.id,
@@ -3106,7 +3262,6 @@ export function createToolGatewayService(
         await requestElicitationForRecordedToolCall({ session, tool, invocationId, request: resultElicitation });
       }
       const result = normalizeMcpToolResult(payloadRecord.result);
-      await markRemoteConnectionHealth(connection, "ok", "Remote MCP server responded to tools/call.");
       return { result, headerSummary, execution };
     } catch (error) {
       if (error instanceof ToolGatewayHttpError) {
@@ -3116,14 +3271,13 @@ export function createToolGatewayService(
         });
       }
       if (error instanceof Error && error.name === "AbortError") {
-        await markRemoteConnectionHealth(connection, "error", "Remote MCP tool call timed out.");
         throw new ToolGatewayHttpError(504, "Remote MCP tool call timed out", "tool_timeout", {
           connectionId: connection.id,
           catalogEntryId: entry.id,
           execution,
         });
       }
-      await markRemoteConnectionHealth(connection, "error", "Remote MCP tool call failed.");
+      await recordRemoteConnectionFailure(session, connection, "Remote MCP tool call failed.", "mcp_remote_fetch_failed");
       throw new ToolGatewayHttpError(502, "Remote MCP tool call failed", "mcp_remote_fetch_failed", {
         connectionId: connection.id,
         catalogEntryId: entry.id,
@@ -3780,12 +3934,14 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const resultPayload = completeStoredToolResult(resultValidation);
       await db
         .update(toolInvocations)
         .set({
           status: "succeeded",
           resultHash: resultValidation.summary.sha256 ?? null,
           resultSummary: resultValidation.summary,
+          resultPayload,
           resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
           completedAt: new Date(),
           updatedAt: new Date(),
@@ -4016,6 +4172,7 @@ export function createToolGatewayService(
   }
 
   function storedInvocationResult(invocation: typeof toolInvocations.$inferSelect): unknown {
+    if (invocation.resultPayload !== null && invocation.resultPayload !== undefined) return invocation.resultPayload;
     const summary = invocation.resultSummary?.summary;
     if (typeof summary !== "string") return null;
     try {
@@ -4251,11 +4408,13 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "block",
       });
+      const resultPayload = completeStoredToolResult(resultValidation);
       const now = new Date();
       await db.update(toolInvocations).set({
         status: "succeeded",
         resultHash: resultValidation.summary.sha256 ?? null,
         resultSummary: resultValidation.summary,
+        resultPayload,
         resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
         completedAt: now,
         updatedAt: now,
@@ -4488,6 +4647,33 @@ export function createToolGatewayService(
       requestedAt: actionRequest.createdAt.toISOString(),
       resolvedAt: actionRequest.resolvedAt ? actionRequest.resolvedAt.toISOString() : null,
     };
+  }
+
+  async function findAdvertisedTool(session: ToolGatewaySession, targetToolName: string): Promise<{ connectionId: string | null } | null> {
+    const rows = await db
+      .select({ details: toolAccessAuditEvents.details })
+      .from(toolAccessAuditEvents)
+      .where(and(
+        eq(toolAccessAuditEvents.companyId, session.companyId),
+        eq(toolAccessAuditEvents.action, "call_completed"),
+        eq(toolAccessAuditEvents.reasonCode, "virtual_tool_completed"),
+        sql`${toolAccessAuditEvents.details}->>'gatewaySessionId' = ${session.id}`,
+      ))
+      .orderBy(desc(toolAccessAuditEvents.createdAt))
+      .limit(20);
+    for (const { details } of rows) {
+      const record = asRecord(details);
+      if (record?.gatewaySessionId !== session.id) continue;
+      const advertisedTools = Array.isArray(record?.advertisedToolRecords) ? record.advertisedToolRecords : [];
+      const match = advertisedTools.find((item) => asRecord(item)?.name === targetToolName);
+      if (match) {
+        const matchRecord = asRecord(match);
+        return { connectionId: typeof matchRecord?.connectionId === "string" ? matchRecord.connectionId : null };
+      }
+      const names = Array.isArray(record?.advertisedToolNames) ? record.advertisedToolNames : [];
+      if (names.some((name) => name === targetToolName)) return { connectionId: null };
+    }
+    return null;
   }
 
   return {
@@ -5370,6 +5556,7 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         const [invocation] = await db.insert(toolInvocations).values({
           companyId: session.companyId,
           actorType: session.actorType ?? (session.agentId ? "agent" : "system"),
@@ -5389,6 +5576,7 @@ export function createToolGatewayService(
           status: "succeeded",
           resultHash: resultValidation.summary.sha256 ?? null,
           resultSummary: resultValidation.summary,
+          resultPayload,
           resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
           startedAt: new Date(),
           completedAt: new Date(),
@@ -5423,6 +5611,22 @@ export function createToolGatewayService(
             argumentsSummary: argumentValidation.summary,
             result: summarizeResult(resultValidation.value),
             resultSummary: resultValidation.summary,
+            advertisedToolNames: (Array.isArray(asRecord(asRecord(resultValidation.value)?.data)?.tools)
+              ? asRecord(asRecord(resultValidation.value)?.data)?.tools as unknown[]
+              : [])
+              .map((item) => asRecord(item)?.name)
+              .filter((name): name is string => typeof name === "string"),
+            advertisedToolRecords: (Array.isArray(asRecord(asRecord(resultValidation.value)?.data)?.tools)
+              ? asRecord(asRecord(resultValidation.value)?.data)?.tools as unknown[]
+              : [])
+              .map((item) => {
+                const record = asRecord(item);
+                return {
+                  name: record?.name ?? null,
+                  connectionId: record?.connectionId ?? null,
+                  catalogEntryId: record?.catalogEntryId ?? null,
+                };
+              }),
           },
         });
         return {
@@ -5435,7 +5639,33 @@ export function createToolGatewayService(
 
       if (tool.name === "run_tool" && tool.providerType === "paperclip_virtual") {
         const { targetToolName, targetParameters } = virtualRunToolInput(requestedParameters);
-        const targetTool = await findToolForSession(session, targetToolName);
+        let targetTool: ToolGatewayDescriptor;
+        let advertisedTool: { connectionId: string | null } | null = null;
+        try {
+          targetTool = await findToolForSession(session, targetToolName);
+        } catch (error) {
+          if (error instanceof ToolGatewayHttpError
+            && error.reasonCode === "tool_not_found"
+            && (advertisedTool = await findAdvertisedTool(session, targetToolName))) {
+            await writeAudit({
+              session,
+              companyId: session.companyId,
+              agentId: session.agentId,
+              runId: session.runId,
+              issueId: session.issueId,
+              action: "tool_gateway.call_failed",
+              details: {
+                reasonCode: "advertised_tool_not_found",
+                sourceErrorReasonCode: error.reasonCode,
+                tool: "run_tool",
+                virtualToolName: "run_tool",
+                targetToolName,
+                connectionId: advertisedTool.connectionId,
+              },
+            });
+          }
+          throw error;
+        }
         if (!isOnDemandRemoteTool(targetTool)) {
           throw new ToolGatewayHttpError(404, `Tool "${targetToolName}" not found`, "tool_not_found", { tool: targetToolName });
         }
@@ -5703,7 +5933,7 @@ export function createToolGatewayService(
             invocationId,
             status: "replayed" as const,
             tool: tool.name,
-            result: recorded.invocation.resultSummary ?? null,
+            result: recorded.invocation.resultPayload ?? recorded.invocation.resultSummary ?? null,
           };
         }
         if (accessDecision.decision === "require_approval") {
@@ -5812,12 +6042,14 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         await db
           .update(toolInvocations)
           .set({
             status: "succeeded",
             resultHash: resultValidation.summary.sha256 ?? null,
             resultSummary: resultValidation.summary,
+            resultPayload,
             resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
             completedAt: new Date(),
             updatedAt: new Date(),
@@ -6025,7 +6257,7 @@ export function createToolGatewayService(
       invocationId = recorded.invocation.id;
 
       if (recorded.replayed) {
-        return recorded.invocation.resultSummary;
+        return recorded.invocation.resultPayload ?? recorded.invocation.resultSummary;
       }
 
       if (accessDecision.decision === "require_approval") {
@@ -6104,12 +6336,14 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block",
         });
+        const resultPayload = completeStoredToolResult(resultValidation);
         await db
           .update(toolInvocations)
           .set({
             status: "succeeded",
             resultHash: resultValidation.summary.sha256 ?? null,
             resultSummary: resultValidation.summary,
+            resultPayload,
             resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
             completedAt: new Date(),
             updatedAt: new Date(),
