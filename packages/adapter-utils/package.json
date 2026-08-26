@@ -32,7 +32,8 @@
     "types": "./dist/index.d.ts"
   },
   "files": [
-    "dist"
+    "dist",
+    "assets"
   ],
   "bundleDependencies": [
     "acpx"

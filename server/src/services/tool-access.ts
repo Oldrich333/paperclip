@@ -845,6 +845,7 @@ function toToolInvocation(row: typeof toolInvocations.$inferSelect): ToolInvocat
     upstreamRequestId: row.upstreamRequestId,
     resultHash: row.resultHash,
     resultSummary: row.resultSummary ?? null,
+    resultPayload: row.resultPayload ?? null,
     resultSizeBytes: row.resultSizeBytes,
     resultArtifactId: row.resultArtifactId,
     errorCode: row.errorCode,

@@ -652,6 +652,7 @@ export const toolInvocations = pgTable(
     upstreamRequestId: text("upstream_request_id"),
     resultHash: text("result_hash"),
     resultSummary: jsonb("result_summary").$type<ToolRedactedValueSummary>(),
+    resultPayload: jsonb("result_payload").$type<unknown>(),
     resultSizeBytes: integer("result_size_bytes"),
     resultArtifactId: uuid("result_artifact_id"),
     errorCode: text("error_code"),

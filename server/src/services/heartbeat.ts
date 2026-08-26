@@ -17,6 +17,7 @@ import {
   type EnvironmentLeaseStatus,
   type ExecutionWorkspace,
   type ExecutionWorkspaceConfig,
+  type HeartbeatRunStatus,
   type HeartbeatRunStatusPhase,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
@@ -27,6 +28,10 @@ import {
   type RunLivenessState,
   type SourceTrustMetadata,
 } from "@paperclipai/shared";
+import {
+  HEARTBEAT_RUN_LIST_DEFAULT_LIMIT,
+  HEARTBEAT_RUN_LIST_MAX_LIMIT,
+} from "@paperclipai/shared/constants";
 import {
   agents,
   agentConfigRevisions,
@@ -1601,7 +1606,16 @@ async function materializeManagedProjectWorkspace(
  * create the managed checkout directory for the project. It throws only when the managed
  * checkout cannot be prepared (for example, a clone failure).
  */
-async function resolveConfiguredOrManagedProjectCwd(input: {
+/**
+ * Resolve a project workspace cwd from an explicit configured path or a managed checkout.
+ *
+ * A configured managed-folder path (for example `_default`) can exist without `.git` — empty or
+ * filled with stale run artifacts. Returning that path unchanged lets git-sensitive local adapters
+ * fail later with `missing_git_metadata` (HIV-1545). When a repo URL is available, rematerialize at
+ * the configured path. When it is not, keep the configured path so explicit non-git shared
+ * workspaces remain valid.
+ */
+export async function resolveConfiguredOrManagedProjectCwd(input: {
   companyId: string;
   projectId: string;
   cwd: string | null;
@@ -1609,13 +1623,23 @@ async function resolveConfiguredOrManagedProjectCwd(input: {
   resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
   const configuredCwd = readNonEmptyString(input.cwd);
+  const repoUrl = readNonEmptyString(input.repoUrl);
   if (configuredCwd && configuredCwd !== REPO_ONLY_CWD_SENTINEL) {
+    if (await hasGitMetadata(configuredCwd)) {
+      return { cwd: configuredCwd, warning: null };
+    }
+    if (repoUrl) {
+      return materializeManagedProjectWorkspace(configuredCwd, {
+        repoUrl,
+        resolveGitAuth: input.resolveGitAuth ?? null,
+      });
+    }
     return { cwd: configuredCwd, warning: null };
   }
   return ensureManagedProjectWorkspace({
     companyId: input.companyId,
     projectId: input.projectId,
-    repoUrl: readNonEmptyString(input.repoUrl),
+    repoUrl,
     resolveGitAuth: input.resolveGitAuth ?? null,
   });
 }
@@ -9406,11 +9430,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? db
           .select({ id: routines.id })
           .from(routines)
+          .innerJoin(issues, eq(issues.id, issue.id))
           .where(
             and(
               eq(routines.companyId, issue.companyId),
-              eq(routines.parentIssueId, issue.id),
               eq(routines.status, "active"),
+              eq(issues.companyId, issue.companyId),
+              or(
+                eq(routines.parentIssueId, issues.id),
+                and(
+                  eq(issues.originKind, "routine_execution"),
+                  eq(issues.originId, routines.id),
+                  eq(routines.concurrencyPolicy, "coalesce_if_active"),
+                  eq(issues.status, "in_progress"),
+                ),
+              ),
             ),
           )
           .limit(1)
@@ -18694,10 +18728,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean; statuses?: HeartbeatRunStatus[] } = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
+      const effectiveLimit = Math.max(
+        1,
+        Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, limit ?? HEARTBEAT_RUN_LIST_DEFAULT_LIMIT),
+      );
+      const statusFilter = options.statuses?.length ? options.statuses : undefined;
+      const conditions = [eq(heartbeatRuns.companyId, companyId)];
+      if (agentId) conditions.push(eq(heartbeatRuns.agentId, agentId));
+      if (statusFilter) conditions.push(inArray(heartbeatRuns.status, statusFilter));
+
       const query = db
         .select(
           summary
@@ -18718,14 +18761,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId))
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(and(...conditions))
         .orderBy(desc(heartbeatRuns.createdAt));
 
-      const rows = limit ? await query.limit(limit) : await query;
+      const rows = await query.limit(effectiveLimit);
       return rows.map((row) => {
         const {
           contextIssueId,

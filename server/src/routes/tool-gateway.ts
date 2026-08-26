@@ -55,6 +55,14 @@ function callerHeaders(req: { headers: Record<string, string | string[] | undefi
   return headers;
 }
 
+function mcpErrorStatus(error: ToolGatewayHttpError): number {
+  // HTTP 404 has a protocol meaning for Streamable HTTP: a request carrying a
+  // session id tells the client that its session is gone. An unknown tool is a
+  // request error, not a missing MCP session; using 404 makes clients such as
+  // Claude report "session expired" and may poison a healthy connection.
+  return error.reasonCode === "tool_not_found" ? 400 : error.status;
+}
+
 async function handleMcpGatewayProtocol(
   req: Request,
   res: Response,
@@ -147,10 +155,11 @@ async function handleMcpGatewayProtocol(
   } catch (err) {
     if (err instanceof ToolGatewayHttpError) {
       const id = (req.body as { id?: unknown } | undefined)?.id ?? null;
-      res.status(err.status).json({
+      const status = mcpErrorStatus(err);
+      res.status(status).json({
         jsonrpc: "2.0",
         id,
-        error: { code: err.status >= 500 ? -32603 : -32000, message: err.message, data: { reasonCode: err.reasonCode, ...err.details } },
+        error: { code: status >= 500 ? -32603 : -32000, message: err.message, data: { reasonCode: err.reasonCode, ...err.details } },
       });
       return;
     }

@@ -80,6 +80,24 @@ export function choosePrimaryRuntimeApiUrl(input: {
   return formatOrigin("http:", "localhost", input.port);
 }
 
+export function chooseAgentRuntimeApiUrl(input: {
+  deploymentExposure?: "private" | "public";
+  authPublicBaseUrl?: string | null;
+  allowedHostnames: string[];
+  bindHost: string;
+  port: number;
+}): string {
+  if (input.deploymentExposure === "private") {
+    const bindHost = normalizeHost(input.bindHost);
+    const loopbackHost =
+      bindHost && !isWildcardHost(bindHost) && !isLoopbackHost(bindHost)
+        ? bindHost
+        : "127.0.0.1";
+    return formatOrigin("http:", loopbackHost, input.port);
+  }
+  return choosePrimaryRuntimeApiUrl(input);
+}
+
 export function collectReachableInterfaceHosts(input: {
   networkInterfacesMap?: NodeJS.Dict<os.NetworkInterfaceInfo[]>;
 } = {}): string[] {

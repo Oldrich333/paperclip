@@ -35,6 +35,12 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : null;
+}
+
 export const sessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
@@ -48,6 +54,13 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(record.promptBundleKey) ??
       readNonEmptyString(record.prompt_bundle_key);
+    const mcpServerIdentity =
+      readNonEmptyString(record.mcpServerIdentity) ??
+      readNonEmptyString(record.mcp_server_identity);
+    const claudeConfigDir =
+      readNonEmptyString(record.claudeConfigDir) ??
+      readNonEmptyString(record.claude_config_dir);
+    const remoteExecution = readRecord(record.remoteExecution) ?? readRecord(record.remote_execution);
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
@@ -55,6 +68,9 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
+      ...(claudeConfigDir ? { claudeConfigDir } : {}),
+      ...(remoteExecution ? { remoteExecution } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
@@ -71,6 +87,13 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(params.promptBundleKey) ??
       readNonEmptyString(params.prompt_bundle_key);
+    const mcpServerIdentity =
+      readNonEmptyString(params.mcpServerIdentity) ??
+      readNonEmptyString(params.mcp_server_identity);
+    const claudeConfigDir =
+      readNonEmptyString(params.claudeConfigDir) ??
+      readNonEmptyString(params.claude_config_dir);
+    const remoteExecution = readRecord(params.remoteExecution) ?? readRecord(params.remote_execution);
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
@@ -78,6 +101,9 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
+      ...(claudeConfigDir ? { claudeConfigDir } : {}),
+      ...(remoteExecution ? { remoteExecution } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),

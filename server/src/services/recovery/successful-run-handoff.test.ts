@@ -292,6 +292,20 @@ describe("successful run handoff decision", () => {
     });
   });
 
+  it("does not queue when an active coalescing routine links through execution issue origin", () => {
+    expect(decide({
+      issue: {
+        ...issue,
+        originKind: "routine_execution",
+        originId: "routine-1",
+      } as any,
+      hasActiveRoutineContinuation: true,
+    })).toEqual({
+      kind: "skip",
+      reason: "active routine continuation owns the next action",
+    });
+  });
+
   it("does not queue when a successful run has no progress signal", () => {
     expect(decide({ livenessState: null, detectedProgressSummary: null })).toEqual({
       kind: "skip",

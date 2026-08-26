@@ -9,6 +9,7 @@ const companyId = "22222222-2222-4222-8222-222222222222";
 const ownerAgentId = "33333333-3333-4333-8333-333333333333";
 const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
+const courierIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -1035,6 +1036,60 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("skips checkout adoption for cross-issue visible writes on same-assignee in-progress issues", async () => {
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: ownerRunId,
+      contextSnapshot: { issueId: courierIssueId },
+    });
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      checkoutRunId: null,
+      executionRunId: null,
+    }));
+
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({ issueId: courierIssueId }),
+    );
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("rejects cross-issue visible writes against another run's active checkout", async () => {
+    const otherRunId = "77777777-7777-4777-8777-777777777777";
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: ownerRunId,
+      contextSnapshot: { issueId: courierIssueId },
+    });
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      checkoutRunId: otherRunId,
+    }));
+
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({ issueId: courierIssueId }),
+    );
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("stores the authenticated agent run id when creating work products", async () => {
     const app = await createApp(ownerActor());
 
@@ -1608,6 +1663,143 @@ describe("agent issue mutation checkout ownership", () => {
       assigneeAgentId: null,
       title: "Claimable update",
     });
+  });
+
+  it("allows a delegated child assignee to block for parent acceptance", async () => {
+    const parentIssueId = "99999999-9999-4999-8999-999999999999";
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      parentId: parentIssueId,
+      assigneeAgentId: ownerAgentId,
+      status: "in_progress",
+    }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ parentId: parentIssueId, assigneeAgentId: ownerAgentId }),
+      ...patch,
+    }));
+
+    const delegatedChildDb = (() => {
+      const runRows = [{
+        id: ownerRunId,
+        companyId,
+        agentId: ownerAgentId,
+        agentCompanyId: companyId,
+        contextSnapshot: {},
+      }];
+      const rowsForSelection = (selection: Record<string, unknown>) => {
+        const keys = Object.keys(selection);
+        if (keys.includes("contextSnapshot")) return runRows;
+        if (keys.includes("agentCompanyId")) return runRows;
+        if (keys.includes("assigneeAgentId")) return [{ assigneeAgentId: peerAgentId }];
+        if (keys.includes("issueRelations")) return [{ id: "relation-1" }];
+        if (keys.includes("status")) return [];
+        return [{ id: peerAgentId, companyId }];
+      };
+      const buildQuery = (selection: Record<string, unknown>) => {
+        const rows = rowsForSelection(selection);
+        const whereResult = {
+          orderBy: vi.fn(async () => []),
+          limit: vi.fn(() => ({
+            then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(rows),
+          })),
+          then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(rows),
+        };
+        const query = {
+          innerJoin: vi.fn(() => query),
+          where: vi.fn(() => whereResult),
+        };
+        return query;
+      };
+      return {
+        transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+        select: vi.fn((selection: Record<string, unknown> = {}) => ({
+          from: vi.fn(() => buildQuery(selection)),
+        })),
+      };
+    })();
+
+    const res = await request(await createApp(ownerActor(), delegatedChildDb)).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      unblockDescriptor: {
+        owner: { agentId: peerAgentId },
+        action: "Accept the delivery packet or return a correction",
+      },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        status: "blocked",
+        unblockDescriptor: {
+          owner: { agentId: peerAgentId },
+          action: "Accept the delivery packet or return a correction",
+        },
+      }),
+    );
+  });
+
+  it("rejects delegated child blocked handoff that names a non-parent assignee", async () => {
+    const parentIssueId = "99999999-9999-4999-8999-999999999999";
+    const wrongLeaderId = "88888888-8888-4888-8888-888888888888";
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      parentId: parentIssueId,
+      assigneeAgentId: ownerAgentId,
+      status: "in_progress",
+    }));
+
+    const delegatedChildDb = (() => {
+      const runRows = [{
+        id: ownerRunId,
+        companyId,
+        agentId: ownerAgentId,
+        agentCompanyId: companyId,
+        contextSnapshot: {},
+      }];
+      const rowsForSelection = (selection: Record<string, unknown>) => {
+        const keys = Object.keys(selection);
+        if (keys.includes("contextSnapshot")) return runRows;
+        if (keys.includes("agentCompanyId")) return runRows;
+        if (keys.includes("assigneeAgentId")) return [{ assigneeAgentId: peerAgentId }];
+        if (keys.includes("issueRelations")) return [{ id: "relation-1" }];
+        if (keys.includes("status")) return [];
+        return [{ id: wrongLeaderId, companyId }];
+      };
+      const buildQuery = (selection: Record<string, unknown>) => {
+        const rows = rowsForSelection(selection);
+        const whereResult = {
+          orderBy: vi.fn(async () => []),
+          limit: vi.fn(() => ({
+            then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(rows),
+          })),
+          then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(rows),
+        };
+        const query = {
+          innerJoin: vi.fn(() => query),
+          where: vi.fn(() => whereResult),
+        };
+        return query;
+      };
+      return {
+        transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+        select: vi.fn((selection: Record<string, unknown> = {}) => ({
+          from: vi.fn(() => buildQuery(selection)),
+        })),
+      };
+    })();
+
+    const res = await request(await createApp(ownerActor(), delegatedChildDb)).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      unblockDescriptor: {
+        owner: { agentId: wrongLeaderId },
+        action: "Accept the delivery packet",
+      },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe(
+      "Delegated child acceptance handoff must name the parent issue assignee as unblockDescriptor.owner",
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it.each([

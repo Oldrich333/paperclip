@@ -84,8 +84,8 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
-COPY scripts/docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chown node:node /usr/local/bin/docker-entrypoint.sh && chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 COPY --chown=node:node --from=build /app /app
 

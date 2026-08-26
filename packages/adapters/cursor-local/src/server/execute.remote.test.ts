@@ -266,6 +266,76 @@ describe("cursor remote execution", () => {
     expect(call?.[2]).toContain("session-123");
   });
 
+  it("runs in place at the authoritative root without archiving the workspace", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-in-place-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-in-place",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Cursor Builder",
+        adapterType: "cursor",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: { command: "agent" },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "task_session",
+        },
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/copied/workspace",
+        workspaceRealization: {
+          mode: "in_place",
+          authoritativeRoot: "/app",
+          pathAliases: [],
+          outboundRestorePaths: [],
+        },
+        spec: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/app",
+          remoteCwd: "/app",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(prepareWorkspaceForSshExecution).not.toHaveBeenCalled();
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
+    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/app/.paperclip-runtime/cursor/skills",
+      followSymlinks: true,
+    }));
+    expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
+    const call = runChildProcess.mock.calls[0] as unknown as
+      | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
+      | undefined;
+    expect(call?.[2]).toContain("--workspace");
+    expect(call?.[2]).toContain("/app");
+    expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe("/app");
+    expect(call?.[3].env.PAPERCLIP_WORKSPACE_REALIZATION_MODE).toBe("in_place");
+    expect(call?.[3].env.PAPERCLIP_WORKSPACE_AUTHORITATIVE_ROOT).toBe("/app");
+    expect(call?.[3].remoteExecution?.remoteCwd).toBe("/app");
+  });
+
   it("restores the remote workspace if skills sync fails after workspace prep", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-remote-sync-fail-"));
     cleanupDirs.push(rootDir);

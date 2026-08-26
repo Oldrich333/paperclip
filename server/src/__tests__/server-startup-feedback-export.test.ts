@@ -720,6 +720,6 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("https://paperclip.example");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
   });
 });

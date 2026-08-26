@@ -28,7 +28,7 @@ export function crossIssueInfluenceRunContextError() {
   return forbidden(body.error, body.details);
 }
 
-function readRunSourceIssueId(contextSnapshot: unknown) {
+export function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;
   for (const candidate of [context.issueId, context.taskId]) {

@@ -1,11 +1,36 @@
 import { describe, expect, it } from "vitest";
 import {
   buildRuntimeApiCandidateUrls,
+  chooseAgentRuntimeApiUrl,
   choosePrimaryRuntimeApiUrl,
   collectReachableInterfaceHosts,
 } from "../runtime-api.js";
 
 describe("runtime API discovery", () => {
+  it("uses loopback for agent runtime URL on private deployments", () => {
+    expect(
+      chooseAgentRuntimeApiUrl({
+        deploymentExposure: "private",
+        authPublicBaseUrl: "https://hive.thelunacare.com",
+        allowedHostnames: ["hive.thelunacare.com"],
+        bindHost: "0.0.0.0",
+        port: 3100,
+      }),
+    ).toBe("http://127.0.0.1:3100");
+  });
+
+  it("keeps the public auth URL for agent runtime on public deployments", () => {
+    expect(
+      chooseAgentRuntimeApiUrl({
+        deploymentExposure: "public",
+        authPublicBaseUrl: "https://paperclip.example.com/base/path",
+        allowedHostnames: ["198.51.100.10"],
+        bindHost: "0.0.0.0",
+        port: 3102,
+      }),
+    ).toBe("https://paperclip.example.com");
+  });
+
   it("prefers the explicit public base URL for the primary runtime URL", () => {
     expect(
       choosePrimaryRuntimeApiUrl({
