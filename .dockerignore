@@ -8,4 +8,3 @@ coverage
 data
 tmp
 *.log
-scripts/verify-production-source-match.sh
