@@ -29,6 +29,7 @@ import {
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
+  batchIssueDispositionSchema,
   checkoutIssueSchema,
   linkIssueApprovalSchema,
   createIssueWorkProductSchema,
@@ -2273,6 +2274,21 @@ registry.registerPath({
   summary: "Get an issue",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/batch-dispositions",
+  tags: ["issues"],
+  summary: "Apply bounded batch issue dispositions",
+  request: { body: jsonBody(batchIssueDispositionSchema) },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    429: { description: "Cross-issue influence call cap exceeded" },
+  },
 });
 
 registry.registerPath({

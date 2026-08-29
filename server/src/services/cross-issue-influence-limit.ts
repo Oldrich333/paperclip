@@ -7,6 +7,9 @@ import { logger } from "../middleware/logger.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
+export const CROSS_ISSUE_BATCH_DISPOSITION_CALL_ITEM_LIMIT = 50;
+export const CROSS_ISSUE_BATCH_DISPOSITION_ITEM_LIMIT = 100;
+export const CROSS_ISSUE_BATCH_DISPOSITION_ACTIVITY = "issue.batch_disposition_applied";
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
@@ -17,7 +20,7 @@ const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap
  * audience is not a licence to resolve, wake, and spawn suggested tasks across
  * the whole company from one run.
  */
-export type CrossIssueInfluenceKind = "comment" | "update" | "interaction_resolution";
+export type CrossIssueInfluenceKind = "comment" | "update" | "interaction_resolution" | "batch_disposition";
 
 export type CrossIssueInfluenceDecision = {
   allowed: boolean;
@@ -79,12 +82,13 @@ export async function observeCrossIssueInfluence(
     kind: CrossIssueInfluenceKind;
     now?: Date;
   },
+  transaction?: Db,
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
   if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
 
-  return db.transaction(async (tx) => {
+  const observe = async (tx: Db) => {
     const run = await tx
       .select({
         id: heartbeatRuns.id,
@@ -175,7 +179,9 @@ export async function observeCrossIssueInfluence(
     }
 
     return decision;
-  });
+  };
+
+  return transaction ? observe(transaction) : db.transaction((tx) => observe(tx as unknown as Db));
 }
 
 export function crossIssueInfluenceLimitError(

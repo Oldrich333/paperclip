@@ -613,6 +613,26 @@ export const updateIssueSchema = objectWithoutDefaults(
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
+
+// Keep reason validation permissive at the request level so one malformed
+// disposition does not invalidate otherwise actionable siblings. The route
+// enforces the per-item non-empty invariant while applying the batch.
+export const batchIssueDispositionItemSchema = z.object({
+  issueId: z.string().uuid(),
+  status: z.enum(ISSUE_STATUSES),
+  reason: multilineTextSchema.pipe(z.string().max(4000)).optional().nullable(),
+  addLabels: z.array(z.string().uuid()).max(50).optional(),
+  removeLabels: z.array(z.string().uuid()).max(50).optional(),
+}).strict();
+
+export type BatchIssueDispositionItem = z.infer<typeof batchIssueDispositionItemSchema>;
+
+export const batchIssueDispositionSchema = z.object({
+  dispositions: z.array(batchIssueDispositionItemSchema).min(1).max(50),
+}).strict();
+
+export type BatchIssueDisposition = z.infer<typeof batchIssueDispositionSchema>;
+
 export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorkspaceSettingsSchema>;
 
 export const stalledReviewDecisionSchema = z.object({

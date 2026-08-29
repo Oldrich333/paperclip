@@ -148,6 +148,23 @@ describe("cross-issue influence limit rollout", () => {
     ]);
   });
 
+  it("charges one influence call for a batch disposition regardless of item count", async () => {
+    const fake = counterDb();
+    const base = {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      now: new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT.getTime() - 1),
+    } as const;
+
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "batch_disposition" }))
+      .resolves.toMatchObject({ count: 1, allowed: true });
+
+    expect(fake.observedCount).toBe(1);
+    expect((fake.inserted[0]!.details as { kind: string }).kind).toBe("batch_disposition");
+  });
+
   it("does not count same-issue writes", async () => {
     const fake = counterDb(0, {
       contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" },

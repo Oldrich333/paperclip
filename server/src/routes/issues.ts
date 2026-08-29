@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, isNull, like, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -28,6 +28,7 @@ import {
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
+  batchIssueDispositionSchema,
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
@@ -72,6 +73,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   type CompactIssue,
+  type BatchIssueDispositionItem,
   type CompanySearchExtractQuery,
   type CompanySearchExtractResponse,
   type CompanySearchQuery,
@@ -251,6 +253,10 @@ import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interact
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
+  CROSS_ISSUE_BATCH_DISPOSITION_CALL_ITEM_LIMIT,
+  CROSS_ISSUE_BATCH_DISPOSITION_ACTIVITY,
+  CROSS_ISSUE_BATCH_DISPOSITION_ITEM_LIMIT,
+  CROSS_ISSUE_INFLUENCE_LIMIT,
   observeCrossIssueInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
@@ -4135,6 +4141,52 @@ export function issueRoutes(
     return true;
   }
 
+  async function batchDispositionAuthorizationAllowed(
+    req: Request,
+    issue: IssueRouteSnapshot,
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+
+    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (watchdogScope.kind !== "none") {
+      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
+      if (scopeResult.kind === "invalid") return false;
+      if (watchdogScope.kind !== "watchdog") return true;
+      if (watchdogScope.watchdogIssueId && issue.id === watchdogScope.watchdogIssueId) return true;
+      const revalidated = await taskWatchdogsSvc.revalidateMutationScope(watchdogScope);
+      return revalidated.allowed;
+    }
+
+    const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    if (!boundaryDecision.allowed) return false;
+    if (issue.assigneeAgentId === null) return true;
+    if (issue.assigneeAgentId !== req.actor.agentId) {
+      if (await hasActiveCheckoutManagementOverride(req.actor.agentId, issue.companyId, issue.assigneeAgentId)) {
+        return true;
+      }
+      return issue.status !== "in_progress";
+    }
+    if (issue.status !== "in_progress") return true;
+    const runId = req.actor.runId?.trim();
+    if (!runId) return false;
+    try {
+      await svc.assertCheckoutOwner(issue.id, req.actor.agentId, runId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function batchDispositionErrorCode(error: unknown) {
+    if (!(error instanceof HttpError)) return "disposition_rejected";
+    const details = error.details;
+    if (details && typeof details === "object" && !Array.isArray(details)) {
+      const code = (details as Record<string, unknown>).code;
+      if (typeof code === "string" && code.trim()) return code;
+    }
+    return `http_${error.status}`;
+  }
+
   async function assertFreshTaskWatchdogSourceMutation(
     res: Response,
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
@@ -5847,6 +5899,271 @@ export function issueRoutes(
   });
 
   // Common malformed path when companyId is empty in "/api/companies/{companyId}/issues".
+  router.post("/issues/batch-dispositions", validate(batchIssueDispositionSchema), async (req, res) => {
+    if (req.actor.type !== "agent") {
+      throw forbidden("Agent authentication required");
+    }
+    const actorAgentId = req.actor.agentId?.trim();
+    const companyId = req.actor.companyId?.trim();
+    const runId = req.actor.runId?.trim();
+    if (!actorAgentId || !companyId || !runId) throw crossIssueInfluenceRunContextError();
+
+    const actor = getActorInfo(req);
+    const dispositions = req.body.dispositions as BatchIssueDispositionItem[];
+    if (dispositions.length > CROSS_ISSUE_BATCH_DISPOSITION_CALL_ITEM_LIMIT) {
+      throw badRequest("Batch disposition call exceeds its item limit", {
+        code: "batch_disposition_call_item_limit_exceeded",
+        itemCap: CROSS_ISSUE_BATCH_DISPOSITION_CALL_ITEM_LIMIT,
+      });
+    }
+    const postCommitActivityPublications: ActivityPublication[] = [];
+    const outcome = await db.transaction(async (tx) => {
+      const run = await tx
+        .select({
+          id: heartbeatRuns.id,
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          responsibleUserId: heartbeatRuns.responsibleUserId,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, actorAgentId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!run) throw crossIssueInfluenceRunContextError();
+      const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+      if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+
+      const issueIds = [...new Set(dispositions.map((item) => item.issueId))];
+      const visibleIssues = await tx
+        .select({ id: issueRows.id, identifier: issueRows.identifier })
+        .from(issueRows)
+        .where(and(
+          eq(issueRows.companyId, companyId),
+          inArray(issueRows.id, issueIds),
+        ));
+      const sourceMatches = (issue: { id: string; identifier: string | null }) =>
+        issue.id === sourceIssueId ||
+        (issue.identifier !== null && issue.identifier.toUpperCase() === sourceIssueId.toUpperCase());
+      const targetIssue = visibleIssues.find((issue) => !sourceMatches(issue));
+      const influenceDecision = targetIssue
+        ? await observeCrossIssueInfluence(db, {
+            companyId,
+            runId,
+            agentId: actorAgentId,
+            responsibleUserId: actor.actorType === "agent"
+              ? authenticatedActorResponsibleUserId(req)
+              : run.responsibleUserId,
+            targetIssueId: targetIssue.id,
+            targetIssueIdentifier: targetIssue.identifier,
+            kind: "batch_disposition",
+          }, tx as unknown as Db)
+        : null;
+
+      const itemsUsed = await tx
+        .select({ count: count() })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, CROSS_ISSUE_BATCH_DISPOSITION_ACTIVITY),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+      const observedCallCount = await tx
+        .select({ count: count() })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "issue.cross_issue_influence_observed"),
+        ))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+      const callsUsed: number = influenceDecision?.count ?? observedCallCount;
+
+      const budget = {
+        itemsUsed,
+        itemCap: CROSS_ISSUE_BATCH_DISPOSITION_ITEM_LIMIT,
+        callsUsed,
+        callCap: CROSS_ISSUE_INFLUENCE_LIMIT,
+      };
+      if (influenceDecision && !influenceDecision.allowed) {
+        return {
+          kind: "influence_cap" as const,
+          budget,
+          decision: influenceDecision,
+        };
+      }
+
+      const results: Array<Record<string, unknown>> = [];
+      let appliedItems = itemsUsed;
+      for (const disposition of dispositions) {
+        const reason = typeof disposition.reason === "string" ? disposition.reason.trim() : "";
+        if (!reason) {
+          results.push({ issueId: disposition.issueId, applied: false, errorCode: "reason_required" });
+          continue;
+        }
+        if (appliedItems >= CROSS_ISSUE_BATCH_DISPOSITION_ITEM_LIMIT) {
+          results.push({ issueId: disposition.issueId, applied: false, errorCode: "item_cap_exceeded" });
+          continue;
+        }
+
+        const result = await tx.transaction(async (itemTx) => {
+          const existing = await itemTx
+            .select()
+            .from(issueRows)
+            .where(and(
+              eq(issueRows.id, disposition.issueId),
+              eq(issueRows.companyId, companyId),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (!existing) {
+            return { issueId: disposition.issueId, applied: false, errorCode: "issue_not_found" };
+          }
+          if (!(await batchDispositionAuthorizationAllowed(req, existing))) {
+            return { issueId: disposition.issueId, applied: false, errorCode: "not_authorized" };
+          }
+
+          try {
+            if (
+              existing.status === "in_review" &&
+              (disposition.status === "done" || disposition.status === "cancelled") &&
+              existing.reviewPolicy != null &&
+              existing.reviewPolicy !== "anyone"
+            ) {
+              await assertIssueReviewVerdictActorAllowed(db, {
+                issue: existing,
+                actor: { type: actor.actorType, id: actor.actorId },
+                reviewPolicy: existing.reviewPolicy,
+              });
+            }
+            await assertAgentInReviewReviewPath({
+              existing,
+              updateFields: { status: disposition.status },
+              actorType: actor.actorType,
+              actorAgentId,
+              actorRunId: runId,
+            });
+
+            const currentLabels = await itemTx
+              .select({ labelId: issueLabels.labelId })
+              .from(issueLabels)
+              .where(and(
+                eq(issueLabels.issueId, existing.id),
+                eq(issueLabels.companyId, companyId),
+              ));
+            const labelsChanged = disposition.addLabels !== undefined || disposition.removeLabels !== undefined;
+            const removeLabels = new Set(disposition.removeLabels ?? []);
+            const nextLabelIds = [...new Set([
+              ...currentLabels
+                .map((label) => label.labelId)
+                .filter((labelId) => !removeLabels.has(labelId)),
+              ...(disposition.addLabels ?? []),
+            ])].filter((labelId) => !removeLabels.has(labelId));
+            const updated = await svc.update(existing.id, {
+              status: disposition.status,
+              ...(labelsChanged ? { labelIds: nextLabelIds } : {}),
+              actorAgentId,
+              actorUserId: null,
+            }, itemTx as unknown as Parameters<typeof svc.update>[2], postCommitActivityPublications);
+            if (!updated) {
+              return { issueId: disposition.issueId, applied: false, errorCode: "issue_not_found" };
+            }
+
+            const comment = await svc.addComment(
+              updated.id,
+              reason,
+              {
+                agentId: actorAgentId,
+                runId,
+                onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+              },
+              {
+                authorType: "agent",
+                authorizationReason: "batch_disposition",
+                sourceTrust: await sourceTrustForActorWrite(existing, actor),
+              },
+              itemTx,
+            );
+            await logActivity(itemTx as unknown as Db, {
+              companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+              action: CROSS_ISSUE_BATCH_DISPOSITION_ACTIVITY,
+              entityType: "issue",
+              entityId: updated.id,
+              details: {
+                identifier: updated.identifier,
+                sourceIssueId,
+                requestedStatus: disposition.status,
+                appliedStatus: updated.status,
+                reason,
+                commentId: comment.id,
+              },
+            }, postCommitActivityPublications);
+            return {
+              issueId: disposition.issueId,
+              applied: true,
+              status: updated.status,
+              reason,
+              commentId: comment.id,
+            };
+          } catch (error) {
+            if (error instanceof HttpError) {
+              return {
+                issueId: disposition.issueId,
+                applied: false,
+                errorCode: batchDispositionErrorCode(error),
+              };
+            }
+            throw error;
+          }
+        });
+        results.push(result);
+        if (result.applied) appliedItems += 1;
+      }
+
+      return {
+        kind: "applied" as const,
+        results,
+        budget: {
+          itemsUsed: appliedItems,
+          itemCap: CROSS_ISSUE_BATCH_DISPOSITION_ITEM_LIMIT,
+          callsUsed,
+          callCap: CROSS_ISSUE_INFLUENCE_LIMIT,
+        },
+      };
+    });
+
+    if (outcome.kind === "influence_cap") {
+      const response = crossIssueInfluenceLimitError(outcome.decision);
+      res.status(429).json({
+        ...response,
+        details: {
+          ...response.details,
+          ...outcome.budget,
+          itemsRemaining: Math.max(0, outcome.budget.itemCap - outcome.budget.itemsUsed),
+          callsRemaining: Math.max(0, outcome.budget.callCap - outcome.budget.callsUsed),
+        },
+      });
+      return;
+    }
+    for (const publication of postCommitActivityPublications) publishActivity(publication);
+    res.json({
+      results: outcome.results,
+      ...outcome.budget,
+      itemsRemaining: Math.max(0, outcome.budget.itemCap - outcome.budget.itemsUsed),
+      callsRemaining: Math.max(0, outcome.budget.callCap - outcome.budget.callsUsed),
+    });
+  });
+
   router.get("/issues", (_req, res) => {
     res.status(400).json({
       error: "Missing companyId in path. Use /api/companies/{companyId}/issues.",
