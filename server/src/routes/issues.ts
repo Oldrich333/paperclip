@@ -6011,23 +6011,24 @@ export function issueRoutes(
           continue;
         }
 
-        const result = await tx.transaction(async (itemTx) => {
-          const existing = await itemTx
-            .select()
-            .from(issueRows)
-            .where(and(
-              eq(issueRows.id, disposition.issueId),
-              eq(issueRows.companyId, companyId),
-            ))
-            .then((rows) => rows[0] ?? null);
-          if (!existing) {
-            return { issueId: disposition.issueId, applied: false, errorCode: "issue_not_found" };
-          }
-          if (!(await batchDispositionAuthorizationAllowed(req, existing))) {
-            return { issueId: disposition.issueId, applied: false, errorCode: "not_authorized" };
-          }
+        let result: { issueId: string; applied: boolean; [key: string]: unknown };
+        try {
+          result = await tx.transaction(async (itemTx) => {
+            const existing = await itemTx
+              .select()
+              .from(issueRows)
+              .where(and(
+                eq(issueRows.id, disposition.issueId),
+                eq(issueRows.companyId, companyId),
+              ))
+              .then((rows) => rows[0] ?? null);
+            if (!existing) {
+              return { issueId: disposition.issueId, applied: false, errorCode: "issue_not_found" };
+            }
+            if (!(await batchDispositionAuthorizationAllowed(req, existing))) {
+              return { issueId: disposition.issueId, applied: false, errorCode: "not_authorized" };
+            }
 
-          try {
             if (
               existing.status === "in_review" &&
               (disposition.status === "done" || disposition.status === "cancelled") &&
@@ -6115,17 +6116,18 @@ export function issueRoutes(
               reason,
               commentId: comment.id,
             };
-          } catch (error) {
-            if (error instanceof HttpError) {
-              return {
-                issueId: disposition.issueId,
-                applied: false,
-                errorCode: batchDispositionErrorCode(error),
-              };
-            }
+          });
+        } catch (error) {
+          if (error instanceof HttpError) {
+            result = {
+              issueId: disposition.issueId,
+              applied: false,
+              errorCode: batchDispositionErrorCode(error),
+            };
+          } else {
             throw error;
           }
-        });
+        }
         results.push(result);
         if (result.applied) appliedItems += 1;
       }
