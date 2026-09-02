@@ -197,6 +197,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
+import type { IssueDependencyResolvedWakeup } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
@@ -992,7 +993,7 @@ function buildIssueBlockerDiagnosticsResponse(input: {
       ...blocker,
       isUnresolved,
       isPendingFinalize,
-      isDependencyReady: blocker.status === "done" && !isPendingFinalize,
+      isDependencyReady: (blocker.status === "done" || blocker.status === "cancelled") && !isPendingFinalize,
       flags,
     };
   });
@@ -1059,13 +1060,6 @@ function buildIssueBlockerDiagnosis(input: {
     return `${blockerDiagnosticLabel(input.issue)} is waiting for ${blockerDiagnosticLabel(
       pendingFinalize,
     )} to finish workspace finalization.`;
-  }
-
-  const cancelled = input.blockers.find((blocker) => blocker.status === "cancelled");
-  if (cancelled) {
-    return `${blockerDiagnosticLabel(input.issue)} is blocked by ${blockerDiagnosticLabel(
-      cancelled,
-    )}, which is cancelled; cancelled blockers do not resolve until the blocker relation is removed or replaced.`;
   }
 
   const unresolved = input.blockers.find((blocker) => blocker.isUnresolved);
@@ -1307,13 +1301,6 @@ function buildIssueWakeDiagnosis(input: {
     return `No wake row exists for ${blockerDiagnosticLabel(input.issue)} in the bounded window. ${blockerDiagnosticLabel(
       input.issue,
     )} is waiting for ${blockerDiagnosticLabel(pendingFinalize)} to finish workspace finalization, so issue_blockers_resolved has not fired.`;
-  }
-
-  const cancelled = blockerDiagnostics.blockers.find((blocker) => blocker.status === "cancelled");
-  if (cancelled) {
-    return `No wake row exists for ${blockerDiagnosticLabel(input.issue)} in the bounded window. ${blockerDiagnosticLabel(
-      input.issue,
-    )} is blocked by ${blockerDiagnosticLabel(cancelled)}, which is cancelled; cancelled blockers do not fire issue_blockers_resolved.`;
   }
 
   const unresolved = blockerDiagnostics.blockers.find((blocker) => blocker.isUnresolved);
@@ -6755,6 +6742,7 @@ export function issueRoutes(
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitDependencyWakeups: IssueDependencyResolvedWakeup[] = [];
     const result = await db.transaction(async (tx) => {
       let issue = existing;
       if (outcome === "blocked") {
@@ -6787,6 +6775,7 @@ export function issueRoutes(
           },
           tx,
           postCommitActivityPublications,
+          postCommitDependencyWakeups,
         );
         if (!updatedIssue) throw notFound("Issue not found");
         issue = updatedIssue;
@@ -6808,6 +6797,41 @@ export function issueRoutes(
       return { issue, recoveryAction };
     });
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+    for (const wakeup of postCommitDependencyWakeups) {
+      const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: wakeup.dependentIssueId,
+        resolvedBlockerIssueId: wakeup.blockerIssueId,
+      });
+      try {
+        await enqueueRecoveryActionWakeup(wakeup.dependentAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          payload: {
+            issueId: wakeup.dependentIssueId,
+            resolvedBlockerIssueId: wakeup.blockerIssueId,
+            blockerIssueIds: wakeup.blockerIssueIds,
+            mutation: "recovery_action_service_update",
+          },
+          idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: {
+            issueId: wakeup.dependentIssueId,
+            taskId: wakeup.dependentIssueId,
+            wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+            source: "issue.recovery_action_service_update",
+            resolvedBlockerIssueId: wakeup.blockerIssueId,
+            blockerIssueIds: wakeup.blockerIssueIds,
+          },
+        });
+      } catch (error) {
+        logger.warn(
+          { error, ...wakeup },
+          "failed to emit dependency-resolved wakeup after recovery action resolution",
+        );
+      }
+    }
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
@@ -9479,6 +9503,7 @@ export function issueRoutes(
       value: Awaited<ReturnType<typeof svc.addStopRelayCommentIfNeeded>>;
     } = { value: null };
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitDependencyWakeups: IssueDependencyResolvedWakeup[] = [];
     const issueUpdateData = {
       ...updateFields,
       actorAgentId: actor.agentId ?? null,
@@ -9489,12 +9514,12 @@ export function issueRoutes(
     const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
       if (tx) {
         return shouldCollectCompletionPublication
-          ? svc.update(id, issueUpdateData, tx, postCommitActivityPublications)
-          : svc.update(id, issueUpdateData, tx);
+          ? svc.update(id, issueUpdateData, tx, postCommitActivityPublications, postCommitDependencyWakeups)
+          : svc.update(id, issueUpdateData, tx, undefined, postCommitDependencyWakeups);
       }
       return shouldCollectCompletionPublication
-        ? svc.update(id, issueUpdateData, db, postCommitActivityPublications)
-        : svc.update(id, issueUpdateData);
+        ? svc.update(id, issueUpdateData, db, postCommitActivityPublications, postCommitDependencyWakeups)
+        : svc.update(id, issueUpdateData, db, undefined, postCommitDependencyWakeups);
     };
     const assertLockedReviewPolicyAllowsMutation = async (
       tx: Parameters<typeof svc.update>[2],
@@ -10245,6 +10270,17 @@ export function issueRoutes(
         });
       };
 
+      for (const dependencyWakeup of postCommitDependencyWakeups) {
+        await addDependencyResolvedWakeup({
+          agentId: dependencyWakeup.dependentAgentId,
+          dependentIssueId: dependencyWakeup.dependentIssueId,
+          resolvedBlockerIssueId: dependencyWakeup.blockerIssueId,
+          blockerIssueIds: dependencyWakeup.blockerIssueIds,
+          source: "issue.route_service_update",
+          mutation: "service_update",
+        });
+      }
+
       if (executionStageWakeup) {
         addWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup);
       } else if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
@@ -10388,8 +10424,10 @@ export function issueRoutes(
         }
       }
 
-      const becameDone = existing.status !== "done" && issue.status === "done";
-      if (becameDone) {
+      const becameDependencyTerminal =
+        !["done", "cancelled"].includes(existing.status) &&
+        ["done", "cancelled"].includes(issue.status);
+      if (becameDependencyTerminal) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
           if (!dependent.assigneeAgentId) continue;
@@ -10399,7 +10437,7 @@ export function issueRoutes(
             resolvedBlockerIssueId: issue.id,
             blockerIssueIds: dependent.blockerIssueIds,
             source: "issue.blockers_resolved",
-            mutation: "blocker_done",
+            mutation: issue.status === "cancelled" ? "blocker_cancelled" : "blocker_done",
           });
         }
       }
@@ -12018,6 +12056,7 @@ export function issueRoutes(
     // Without a single transaction, a 422 (or any error) thrown by the status update after the
     // comment is inserted would leave an orphan comment without the corresponding state change.
     let comment: Awaited<ReturnType<typeof svc.addComment>>;
+    const postCommitDependencyWakeups: IssueDependencyResolvedWakeup[] = [];
     if (shouldAutoApproveReviewComment) {
       const transition = applyIssueExecutionPolicyTransition({
         issue: currentIssue,
@@ -12074,8 +12113,8 @@ export function issueRoutes(
             tx,
           );
           const updated = actor.actorType === "user" && currentIssue.status !== "done"
-            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications)
-            : await svc.update(id, updatePatch, tx);
+            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications, postCommitDependencyWakeups)
+            : await svc.update(id, updatePatch, tx, undefined, postCommitDependencyWakeups);
           // Throw (not return null) so drizzle rolls back the inserted comment when the issue
           // has been concurrently deleted between the initial fetch and the in-transaction update.
           if (!updated) throw new AutoApprovalIssueMissingError();
@@ -12298,6 +12337,15 @@ export function issueRoutes(
         });
       };
 
+      for (const dependencyWakeup of postCommitDependencyWakeups) {
+        await addDependencyResolvedWakeup({
+          agentId: dependencyWakeup.dependentAgentId,
+          dependentIssueId: dependencyWakeup.dependentIssueId,
+          resolvedBlockerIssueId: dependencyWakeup.blockerIssueId,
+          blockerIssueIds: dependencyWakeup.blockerIssueIds,
+        });
+      }
+
       if (commentDecisionStageWakeup) {
         addWakeup(commentDecisionStageWakeup.agentId, commentDecisionStageWakeup.wakeup);
       }
@@ -12420,8 +12468,10 @@ export function issueRoutes(
         });
       }
 
-      const becameDone = issueBeforeCommentDecision.status !== "done" && currentIssue.status === "done";
-      if (becameDone) {
+      const becameDependencyTerminal =
+        !["done", "cancelled"].includes(issueBeforeCommentDecision.status) &&
+        ["done", "cancelled"].includes(currentIssue.status);
+      if (becameDependencyTerminal) {
         const dependents = await svc.listWakeableBlockedDependents(currentIssue.id);
         for (const dependent of dependents) {
           if (!dependent.assigneeAgentId) continue;

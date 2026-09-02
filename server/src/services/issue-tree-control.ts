@@ -22,7 +22,7 @@ import {
   type IssueTreePreviewWarning,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
-import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+import type { IssueDependencyResolvedWakeup } from "./issues.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -63,6 +63,7 @@ type TreeStatusUpdateResult = {
     status: IssueStatus;
     assigneeAgentId: string | null;
   }>;
+  dependencyWakeups?: IssueDependencyResolvedWakeup[];
 };
 type RestoreTreeStatusResult = TreeStatusUpdateResult & {
   releasedCancelHoldIds: string[];
@@ -409,7 +410,11 @@ function restoreStatusFromCancelSnapshot(status: IssueStatus): IssueStatus | nul
   return status;
 }
 
-export function issueTreeControlService(db: Db) {
+export type IssueTreeControlServiceOptions = {
+  onDependencyResolved?: (wakeup: IssueDependencyResolvedWakeup) => Promise<void>;
+};
+
+export function issueTreeControlService(db: Db, options: IssueTreeControlServiceOptions = {}) {
   async function listTreeIssues(companyId: string, rootIssueId: string): Promise<TreeIssue[]> {
     const root = await db
       .select()
@@ -869,44 +874,55 @@ export function issueTreeControlService(db: Db) {
       .map((member) => member.issueId))];
     if (issueIds.length === 0) return { updatedIssueIds: [], updatedIssues: [] };
 
-    const now = new Date();
+    const dependencyWakeups: IssueDependencyResolvedWakeup[] = [];
+    const { issueService } = await import("./issues.js");
+    const issuesSvc = issueService(db, {
+      onDependencyResolved: options.onDependencyResolved,
+    });
     const updated = await db.transaction(async (tx) => {
-      const rows = await tx
-        .update(issues)
-        .set({
-          status: "cancelled",
-          cancelledAt: now,
-          completedAt: null,
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: now,
-        })
+      const candidates = await tx
+        .select({ id: issues.id })
+        .from(issues)
         .where(
           and(
             eq(issues.companyId, companyId),
             inArray(issues.id, issueIds),
             notInArray(issues.status, ["done", "cancelled"]),
           ),
-        )
-        .returning({
-          id: issues.id,
-          companyId: issues.companyId,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-        });
-
-      for (const issue of rows) {
-        await finalizeSummarySlotsForTerminalIssue(tx, {
-          ...issue,
-          status: coerceIssueStatus(issue.status),
+        );
+      const rows: Array<{
+        id: string;
+        status: IssueStatus;
+        assigneeAgentId: string | null;
+      }> = [];
+      for (const candidate of candidates) {
+        const updatedIssue = await issuesSvc.update(
+          candidate.id,
+          { status: "cancelled" },
+          tx,
+          undefined,
+          dependencyWakeups,
+        );
+        if (!updatedIssue) continue;
+        rows.push({
+          id: updatedIssue.id,
+          status: coerceIssueStatus(updatedIssue.status),
+          assigneeAgentId: updatedIssue.assigneeAgentId,
         });
       }
       return rows;
     });
+
+    if (options.onDependencyResolved) {
+      for (const wakeup of dependencyWakeups) {
+        try {
+          await options.onDependencyResolved(wakeup);
+        } catch {
+          // The dependent is already repaired transactionally. The regular
+          // recovery backstop can retry a lost best-effort agent wakeup.
+        }
+      }
+    }
 
     return {
       updatedIssueIds: updated.map((issue) => issue.id),
@@ -915,6 +931,7 @@ export function issueTreeControlService(db: Db) {
         status: coerceIssueStatus(issue.status),
         assigneeAgentId: issue.assigneeAgentId,
       })),
+      dependencyWakeups,
     };
   }
 

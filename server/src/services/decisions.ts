@@ -9,12 +9,17 @@ import { authorizationService, type AuthorizationActor } from "./authorization.j
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { signDecisionSpec, verifyDecisionSpec } from "./decision-signing.js";
 import { issueService } from "./issues.js";
+import type { IssueDependencyResolvedWakeup } from "./issues.js";
 import { decisionRetentionService, hashAttentionArchiveManifest } from "./decision-retention.js";
+import { logger } from "../middleware/logger.js";
 
 type Snapshot = { status: string; assigneeAgentId: string | null; assigneeUserId: string | null; updatedAt: string;
   descendantCount?: number; descendantIds?: string[]; childCount?: number; attentionArchive?: unknown };
 type Wake = (input: { companyId: string; agentId: string; issueId: string; decisionId: string; outcome: "decided" | "expired" | "cancelled" }) => Promise<unknown>;
-export type DecisionServiceOptions = { wakeOriginAgent: Wake };
+export type DecisionServiceOptions = {
+  wakeOriginAgent: Wake;
+  wakeDependencyAgent?: (wakeup: IssueDependencyResolvedWakeup) => Promise<void>;
+};
 const DAY = 86_400_000;
 
 function targetIds(options: DecisionOption[]) {
@@ -406,6 +411,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
 
     try {
       const postCommitActivityPublications: ActivityPublication[] = [];
+      const postCommitDependencyWakeups: IssueDependencyResolvedWakeup[] = [];
       const executionResult = await db.transaction(async (tx) => {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
         let execution = await tx.select().from(decisionEffectExecutions).where(and(eq(decisionEffectExecutions.decisionId, decision.id), eq(decisionEffectExecutions.effectIndex, effectIndex)))
@@ -460,7 +466,9 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             await collectDescendantIds(decision.companyId, target.id, tx as unknown as Db));
           if (staleReference || changedTree) return finish("skipped", "target_changed", { reason: "target_changed" });
         }
-        const svc = issueService(db);
+        const svc = issueService(db, {
+          onDependencyResolved: options.wakeDependencyAgent,
+        });
         const values = decision.inputValues ?? {};
         let result: Record<string, unknown>;
         if (effect.type === "comment_on_issue") {
@@ -472,6 +480,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             { status: effect.status, actorUserId: decidedByUserId },
             tx,
             postCommitActivityPublications,
+            postCommitDependencyWakeups,
           );
           if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
           result = { issueId: updated?.id, status: updated?.status };
@@ -485,6 +494,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             },
             tx,
             postCommitActivityPublications,
+            postCommitDependencyWakeups,
           );
           if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
           result = { issueId: updated?.id };
@@ -498,6 +508,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             },
             tx,
             postCommitActivityPublications,
+            postCommitDependencyWakeups,
           );
           result = { removedBlockedByIssueIds: effect.removeBlockedByIssueIds };
         } else if (effect.type === "create_issue") {
@@ -515,6 +526,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
               { status: "cancelled", actorUserId: decidedByUserId },
               tx,
               postCommitActivityPublications,
+              postCommitDependencyWakeups,
             );
           }
           await svc.addComment(target.id, interpolate(effect.reasonComment, values), { userId: decidedByUserId }, undefined, tx);
@@ -525,6 +537,18 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         return row;
       });
       for (const publication of postCommitActivityPublications) publishActivity(publication);
+      if (options.wakeDependencyAgent) {
+        for (const wakeup of postCommitDependencyWakeups) {
+          try {
+            await options.wakeDependencyAgent(wakeup);
+          } catch (error) {
+            logger.warn(
+              { error, ...wakeup },
+              "failed to emit dependency-resolved wakeup after decision effect",
+            );
+          }
+        }
+      }
       return executionResult;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Decision effect execution failed";

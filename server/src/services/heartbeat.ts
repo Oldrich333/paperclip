@@ -16436,7 +16436,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .from(issues)
               .where(eq(issues.id, issueId))
               .then((rows) => rows[0]?.status ?? null);
-            if (blockerIssueStatus === "done") {
+            if (blockerIssueStatus === "done" || blockerIssueStatus === "cancelled") {
               await recovery.reconcileResolvedDependencyWakeBackstop({
                 runId: finalizedRun.id,
                 companyId: finalizedRun.companyId,

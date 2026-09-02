@@ -9,6 +9,11 @@ import {
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { heartbeatService, issueService, issueTreeControlService, logActivity } from "../services/index.js";
+import type { IssueDependencyResolvedWakeup } from "../services/issues.js";
+import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  buildIssueBlockersResolvedWakeIdempotencyKey,
+} from "../services/issue-dependency-wakeups.js";
 import { assertBoard, getAccessibleResource, getActorInfo } from "./authz.js";
 
 const TREE_RUN_CANCELLATION_RESPONSE_WAIT_MS = 1_000;
@@ -33,9 +38,37 @@ async function waitForRunCancellationTasks(tasks: Promise<void>[]) {
 
 export function issueTreeControlRoutes(db: Db) {
   const router = Router();
-  const issuesSvc = issueService(db);
-  const treeControlSvc = issueTreeControlService(db);
   const heartbeat = heartbeatService(db);
+  const emitDependencyWakeup = async (wakeup: IssueDependencyResolvedWakeup) => {
+    const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+      dependentIssueId: wakeup.dependentIssueId,
+      resolvedBlockerIssueId: wakeup.blockerIssueId,
+    });
+    await heartbeat.wakeup(wakeup.dependentAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+      payload: {
+        issueId: wakeup.dependentIssueId,
+        resolvedBlockerIssueId: wakeup.blockerIssueId,
+        blockerIssueIds: wakeup.blockerIssueIds,
+        mutation: "tree_cancel_service_update",
+      },
+      idempotencyKey,
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: {
+        issueId: wakeup.dependentIssueId,
+        taskId: wakeup.dependentIssueId,
+        wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        source: "issue.tree_cancel_service_update",
+        resolvedBlockerIssueId: wakeup.blockerIssueId,
+        blockerIssueIds: wakeup.blockerIssueIds,
+      },
+    });
+  };
+  const issuesSvc = issueService(db, { onDependencyResolved: emitDependencyWakeup });
+  const treeControlSvc = issueTreeControlService(db, { onDependencyResolved: emitDependencyWakeup });
 
   async function resolveRootIssue(req: Request) {
     const rootIssueId = req.params.id as string;

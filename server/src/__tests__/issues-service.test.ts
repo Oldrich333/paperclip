@@ -4194,7 +4194,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     { blockerStatus: "done" as const, assigned: false },
     { blockerStatus: "cancelled" as const, assigned: true },
     { blockerStatus: "cancelled" as const, assigned: false },
-  ])("handles a $blockerStatus blocker dependency for $assigned assigned dependents", async ({ blockerStatus, assigned }) => {
+  ])("unblocks a $blockerStatus blocker dependency for $assigned assigned dependents", async ({ blockerStatus, assigned }) => {
     const companyId = randomUUID();
     const assigneeAgentId = assigned ? randomUUID() : null;
     await db.insert(companies).values({
@@ -4236,16 +4236,14 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await expect(svc.getById(dependentId)).resolves.toMatchObject({
       id: dependentId,
-      status: blockerStatus === "done" ? "todo" : "blocked",
+      status: "todo",
     });
     const readiness = await svc.getDependencyReadiness(dependentId);
     expect(readiness).toMatchObject({
-      unresolvedBlockerCount: blockerStatus === "done" ? 0 : 1,
-      isDependencyReady: blockerStatus === "done",
+      unresolvedBlockerCount: 0,
+      isDependencyReady: true,
     });
-    if (blockerStatus === "cancelled") {
-      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
-    }
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
   });
 
   it("repairs the stranded intermediate state when an operator clears the last blocker relation", async () => {

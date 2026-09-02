@@ -90,6 +90,11 @@ import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  buildIssueBlockersResolvedWakeIdempotencyKey,
+} from "./services/issue-dependency-wakeups.js";
+import type { IssueDependencyResolvedWakeup } from "./services/issues.js";
+import {
   coordinateHeartbeatSchedulerShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
@@ -721,6 +726,35 @@ export async function startServer(): Promise<StartedServer> {
     : null;
   const decisionServiceOptions = {
     wakeOriginAgent: createDecisionWakeOriginAgent(heartbeat?.wakeup ?? null),
+    wakeDependencyAgent: async (wakeup: IssueDependencyResolvedWakeup) => {
+      if (!heartbeat) return;
+      const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: wakeup.dependentIssueId,
+        resolvedBlockerIssueId: wakeup.blockerIssueId,
+      });
+      await heartbeat.wakeup(wakeup.dependentAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        payload: {
+          issueId: wakeup.dependentIssueId,
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+          mutation: "decision_service_update",
+        },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: {
+          issueId: wakeup.dependentIssueId,
+          taskId: wakeup.dependentIssueId,
+          wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          source: "issue.decision_service_update",
+          resolvedBlockerIssueId: wakeup.blockerIssueId,
+          blockerIssueIds: wakeup.blockerIssueIds,
+        },
+      });
+    },
   };
   // Managed instances drive bundled plugin auto-install from the managed-config
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means

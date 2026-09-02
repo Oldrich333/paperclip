@@ -1271,9 +1271,10 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
-    if (row.blockerStatus !== "done") {
+    // Both terminal statuses resolve a dependency. A cancelled blocker cannot
+    // make further progress, so keeping it unresolved permanently strands the
+    // dependent even though the dependency graph is no longer actionable.
+    if (row.blockerStatus !== "done" && row.blockerStatus !== "cancelled") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -7755,6 +7756,7 @@ export function issueService(db: Db, options: IssueServiceOptions = {}) {
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
+      postCommitDependencyWakeups?: IssueDependencyResolvedWakeup[],
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications = postCommitActivityPublications ?? ownedActivityPublications;
@@ -8074,7 +8076,10 @@ export function issueService(db: Db, options: IssueServiceOptions = {}) {
             tx,
           );
         }
-        if (existing.status !== updated.status && updated.status === "done") {
+        if (
+          existing.status !== updated.status
+          && (updated.status === "done" || updated.status === "cancelled")
+        ) {
           const unblocked = await unblockResolvedBlockedDependents(tx, updated.id);
           for (const dependent of unblocked) {
             if (dependent.dependentAgentId) dependencyWakeups.push({
@@ -8210,6 +8215,9 @@ export function issueService(db: Db, options: IssueServiceOptions = {}) {
             logger.warn({ error, ...wakeup }, "failed to emit dependency-resolved wakeup after issue update");
           }
         }
+      }
+      if (dbOrTx !== db && postCommitDependencyWakeups) {
+        postCommitDependencyWakeups.push(...dependencyWakeups);
       }
       return result;
     },
